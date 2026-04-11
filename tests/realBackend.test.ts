@@ -120,18 +120,30 @@ test(
       await bridge.handleUpdateForTest(telegramMessageUpdate(2, "/resume"));
       const resumeMessages = telegram.sentMessages.slice(1);
       assert.ok(
-        resumeMessages.some((message) => message.text.includes("Sessions")),
-        "expected /resume to render the session picker header",
+        resumeMessages.some((message) => message.text.includes("Sessions") || message.text.includes("No recent sessions were found.")),
+        "expected /resume to render a workspace-scoped session result",
       );
 
-      await bridge.handleUpdateForTest(telegramMessageUpdate(3, "/status"));
+      await bridge.handleUpdateForTest(telegramMessageUpdate(3, "/continue"));
+      const continueMessages = telegram.sentMessages.slice(2);
+      assert.ok(
+        continueMessages.some((message) => message.text.includes("All Sessions")),
+        "expected /continue to render the global session picker header",
+      );
+
+      const threadId = stateAfterNew.chats["42"]?.threadId;
+      assert.ok(threadId);
+      await bridge.handleUpdateForTest(telegramMessageUpdate(4, `/continue ${threadId}`));
+      assert.match(telegram.sentMessages.at(-1)?.text ?? "", /Took over session/);
+
+      await bridge.handleUpdateForTest(telegramMessageUpdate(5, "/status"));
       assert.match(telegram.sentMessages.at(-1)?.text ?? "", new RegExp(`workspace: ${workspaceDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
       assert.match(telegram.sentMessages.at(-1)?.text ?? "", /thread: /);
 
-      await bridge.handleUpdateForTest(telegramMessageUpdate(4, "/model status"));
+      await bridge.handleUpdateForTest(telegramMessageUpdate(6, "/model status"));
       assert.match(telegram.sentMessages.at(-1)?.text ?? "", /Available models:/);
 
-      await bridge.handleUpdateForTest(telegramMessageUpdate(5, "/permissions status"));
+      await bridge.handleUpdateForTest(telegramMessageUpdate(7, "/permissions status"));
       assert.match(telegram.sentMessages.at(-1)?.text ?? "", /approval policy:/);
     } finally {
       await codex.close();
@@ -220,54 +232,59 @@ test(
       await expectCommand(3, "/workspace", /Current workspace:/);
       await expectCommand(4, "/status", /workspace:/);
       await expectCommand(5, "/new", /Started a fresh Codex thread/);
-      await expectCommand(6, "/resume", /Sessions/);
-      await expectCommand(7, "/interrupt", /No active turn to interrupt/);
-      await expectCommand(8, "/esc", /No active turn to interrupt/);
-      await expectCommand(9, "/ese", /No active turn to interrupt/);
-      await expectCommand(10, "/cancel", /No active interactive prompt/);
-      await expectCommand(11, "/sh pwd", /Confirm explicit shell command/);
-      await expectCommand(12, "/model status", /Available models:/);
-      await expectCommand(13, "/fast status", /Fast mode is/);
-      await expectCommand(14, "/personality status", /Personality:/);
-      await expectCommand(15, "/permissions status", /approval policy:/);
-      await expectCommand(16, "/approvals status", /approval policy:/);
-      await expectCommand(17, "/plan", /(Choose Plan mode|No plan modes were available|Plan mode is unavailable)/);
-      await cancelInteractivePrompt(18);
-      await expectCommand(19, "/collab status", /Collaboration mode:/);
-      await expectCommand(20, "/agent", /(Choose the active agent thread|No agent threads were available)/);
-      await cancelInteractivePrompt(21);
-      await expectCommand(22, "/subagents", /(Choose the active agent thread|No agent threads were available)/);
+      await expectCommand(6, "/resume", /(Sessions|No recent sessions were found\.)/);
+      await expectCommand(7, "/continue", /All Sessions/);
+      const stateAfterNew = await loadState(statePath);
+      const initialThreadId = stateAfterNew.chats["42"]?.threadId;
+      assert.ok(initialThreadId, "expected initial thread id after /new");
+      await expectCommand(8, `/continue ${initialThreadId}`, /Took over session/);
+      await expectCommand(9, "/interrupt", /No active turn to interrupt/);
+      await expectCommand(10, "/esc", /No active turn to interrupt/);
+      await expectCommand(11, "/ese", /No active turn to interrupt/);
+      await expectCommand(12, "/cancel", /No active interactive prompt/);
+      await expectCommand(13, "/sh pwd", /Confirm explicit shell command/);
+      await expectCommand(14, "/model status", /Available models:/);
+      await expectCommand(15, "/fast status", /Fast mode is/);
+      await expectCommand(16, "/personality status", /Personality:/);
+      await expectCommand(17, "/permissions status", /approval policy:/);
+      await expectCommand(18, "/approvals status", /approval policy:/);
+      await expectCommand(19, "/plan", /(Choose Plan mode|No plan modes were available|Plan mode is unavailable)/);
+      await cancelInteractivePrompt(20);
+      await expectCommand(21, "/collab status", /Collaboration mode:/);
+      await expectCommand(22, "/agent", /(Choose the active agent thread|No agent threads were available)/);
       await cancelInteractivePrompt(23);
-      await expectCommand(24, "/review", /Start a review/);
+      await expectCommand(24, "/subagents", /(Choose the active agent thread|No agent threads were available)/);
       await cancelInteractivePrompt(25);
-      await expectCommand(26, "/rename", /Rename the current thread/);
+      await expectCommand(26, "/review", /Start a review/);
       await cancelInteractivePrompt(27);
+      await expectCommand(28, "/rename", /Rename the current thread/);
+      await cancelInteractivePrompt(29);
       await bridge.handleUpdateForTest(
-        telegramMessageUpdate(28, "Reply with the single word ok."),
+        telegramMessageUpdate(30, "Reply with the single word ok."),
       );
       const stateAfterSeedTurn = await loadState(statePath);
       const seededThreadId = stateAfterSeedTurn.chats["42"]?.threadId;
       assert.ok(seededThreadId, "expected seeded thread id after sending a real task");
       assert.ok(stateAfterSeedTurn.chats["42"]?.activeTurnId, "expected active turn id after sending a real task");
       await waitForThreadToSettle(seededThreadId);
-      await expectCommand(29, "/fork", /Forked into a new thread/);
-      await expectCommand(30, "/compact", /Requested thread compaction/);
-      await expectCommand(31, "/clear", /Started a fresh thread/);
-      await expectCommand(32, "/diff", /Git status:/);
-      await expectCommand(33, "/copy", /\/copy/);
-      await expectCommand(34, "/mention README", /Choose a file to mention/);
-      await cancelInteractivePrompt(35);
-      await expectCommand(36, "/skills", /Skills:/);
-      await expectCommand(37, "/mcp", /MCP servers:/);
-      await expectCommand(38, "/apps", /Apps:/);
-      await expectCommand(39, "/plugins", /Plugins:/);
-      await expectCommand(40, "/feedback", /Send feedback/);
-      await cancelInteractivePrompt(41);
-      await expectCommand(42, "/experimental status", /Experimental features:/);
-      await expectCommand(43, "/rollout", /(Rollout path:|No rollout path available\.)/);
-      await expectCommand(44, "/stop", /(Stopping all background terminals|No current thread\. Nothing to stop\.)/);
-      await expectCommand(45, "/clean", /(Stopping all background terminals|No current thread\. Nothing to stop\.)/);
-      await expectCommand(46, "/init", /AGENTS\.md already exists/);
+      await expectCommand(31, "/fork", /Forked into a new thread/);
+      await expectCommand(32, "/compact", /Requested thread compaction/);
+      await expectCommand(33, "/clear", /Started a fresh thread/);
+      await expectCommand(34, "/diff", /Git status:/);
+      await expectCommand(35, "/copy", /\/copy/);
+      await expectCommand(36, "/mention README", /Choose a file to mention/);
+      await cancelInteractivePrompt(37);
+      await expectCommand(38, "/skills", /Skills:/);
+      await expectCommand(39, "/mcp", /MCP servers:/);
+      await expectCommand(40, "/apps", /Apps:/);
+      await expectCommand(41, "/plugins", /Plugins:/);
+      await expectCommand(42, "/feedback", /Send feedback/);
+      await cancelInteractivePrompt(43);
+      await expectCommand(44, "/experimental status", /Experimental features:/);
+      await expectCommand(45, "/rollout", /(Rollout path:|No rollout path available\.)/);
+      await expectCommand(46, "/stop", /(Stopping all background terminals|No current thread\. Nothing to stop\.)/);
+      await expectCommand(47, "/clean", /(Stopping all background terminals|No current thread\. Nothing to stop\.)/);
+      await expectCommand(48, "/init", /AGENTS\.md already exists/);
     } finally {
       await codex.close();
     }

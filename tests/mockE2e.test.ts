@@ -207,7 +207,7 @@ test("bootstrapCodexAnywhere runs a deterministic mocked E2E flow with persisted
     await app1.bridge.handleUpdateForTest(telegramMessageUpdate(2, "/omx version"));
 
     assert.equal(telegram1.sentMessages.length, 1);
-    assert.match(telegram1.sentMessages[0]!.text, /OMX command finished/);
+    assert.match(telegram1.sentMessages[0]!.text, /<b>OMX<\/b>/);
     assert.match(telegram1.sentMessages[0]!.text, /omx version/);
     assert.match(telegram1.sentMessages[0]!.text, /omx-test 1\.2\.3/);
     assert.equal(telegram1.sentMessages[0]!.parseMode, "HTML");

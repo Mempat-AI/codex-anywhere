@@ -7,35 +7,36 @@ export function formatApprovalPromptHtml(
   params: JsonObject,
   items: Map<string, JsonObject>,
 ): string {
-  const reason = asString(params.reason) ?? "no reason provided";
+  const reason = asString(params.reason) ?? "";
   if (method === "item/commandExecution/requestApproval") {
-    return [
-      `<b>Codex wants approval to run a command.</b>`,
-      `command: <code>${escapeTelegramHtml(asString(params.command) ?? "<unknown>")}</code>`,
-      `cwd: <code>${escapeTelegramHtml(asString(params.cwd) ?? "<unknown>")}</code>`,
-      `reason: ${escapeTelegramHtml(reason)}`,
-    ].join("\n");
+    const lines = [
+      `<b>Approve command?</b>`,
+      `<code>${escapeTelegramHtml(asString(params.command) ?? "<unknown>")}</code>`,
+      `<code>${escapeTelegramHtml(asString(params.cwd) ?? "<unknown>")}</code>`,
+    ];
+    if (reason) lines.push(escapeTelegramHtml(reason));
+    return lines.join("\n");
   }
 
   if (method === "item/fileChange/requestApproval") {
     const itemId = asString(params.itemId);
     const item = itemId ? items.get(itemId) : undefined;
     const paths = collectChangePaths(item).slice(0, 5);
-    return [
-      `<b>Codex wants approval to apply file changes.</b>`,
+    const lines = [
+      `<b>Approve file changes?</b>`,
       paths.length > 0
-        ? `paths:\n${paths.map((path) => `<code>${escapeTelegramHtml(path)}</code>`).join("\n")}`
-        : "paths: (paths unavailable)",
-      `reason: ${escapeTelegramHtml(reason)}`,
-    ].join("\n");
+        ? paths.map((p) => `<code>${escapeTelegramHtml(p)}</code>`).join("\n")
+        : "(paths unavailable)",
+    ];
+    if (reason) lines.push(escapeTelegramHtml(reason));
+    return lines.join("\n");
   }
 
   const permissions = escapeTelegramHtml(JSON.stringify(params.permissions ?? {}, null, 2));
-  return [
-    `<b>Codex wants additional permissions.</b>`,
-    `reason: ${escapeTelegramHtml(reason)}`,
-    `<pre>${permissions}</pre>`,
-  ].join("\n\n");
+  const lines = [`<b>Grant permissions?</b>`];
+  if (reason) lines.push(escapeTelegramHtml(reason));
+  lines.push("", `<pre>${permissions}</pre>`);
+  return lines.join("\n");
 }
 
 export function formatCommandCompletionHtml(item: JsonObject, verbose = false): string {

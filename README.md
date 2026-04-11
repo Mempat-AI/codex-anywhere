@@ -73,7 +73,16 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 ## Usage
 
 **Resume an existing Codex session:**
-- send `/resume`, pick a session, tap `Take Over`
+- send `/resume` to browse sessions in the current workspace
+- session lists are paginated at 8 items per page
+- tap `Take Over` to bind the Telegram chat to that session
+
+**Continue from any workspace:**
+- send `/continue` to browse sessions globally
+- send `/continue <session-id>` to continue a specific session directly
+- global session lists are paginated at 8 items per page
+- if the target session belongs to another workspace, Codex Anywhere asks before switching workspace
+- after takeover, Codex Anywhere shows a compact preview of the last 3 turns to restore context
 
 **Start a new session:**
 - send `/new`, or just send a task like `fix tests`
@@ -106,13 +115,15 @@ Telegram-native:
 | Command | Description |
 |---|---|
 | `/workspace <path>` | Show or change the bot workspace |
+| `/resume` | Browse and continue sessions in the current workspace |
+| `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
 | `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
 | `/omx [args]` | Run [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) CLI commands from Telegram |
 | `/esc` `/ese` | Interrupt aliases |
 
 Codex commands supported through the bridge:
 
-`/start` `/help` `/new` `/resume` `/interrupt` `/cancel` `/status` `/sh` `/model` `/fast` `/personality` `/permissions` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
+`/start` `/help` `/new` `/resume` `/continue` `/interrupt` `/cancel` `/status` `/sh` `/model` `/fast` `/personality` `/permissions` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
 
 ## Development
 
@@ -133,7 +144,7 @@ pnpm run typecheck
 pnpm run build
 ```
 
-The `test` lane is fully local and deterministic — no real Telegram, `codex`, `omx`, or network access. CI covers mocked E2E startup, routing, `/omx` commands, resume/restart behavior, and preflight failure paths.
+The `test` lane is fully local and deterministic — no real Telegram, `codex`, `omx`, or network access. CI covers mocked E2E startup, routing, `/omx` commands, session continuity flows, and preflight failure paths.
 
 ## Contributing
 

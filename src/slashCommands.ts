@@ -10,6 +10,7 @@ const SUPPORTED_CODEX_COMMANDS = new Set([
   "clear",
   "collab",
   "compact",
+  "continue",
   "copy",
   "diff",
   "esc",
@@ -106,6 +107,7 @@ export function isTaskBlockingSlashCommand(name: string): boolean {
     "logout",
     "model",
     "new",
+    "continue",
     "personality",
     "plan",
     "permissions",
@@ -130,7 +132,7 @@ export function normalizeReasoningEffort(value: string): string | null {
 export function codexSlashHelpText(): string {
   return [
     "Codex Anywhere commands:",
-    "/start, /help, /new, /resume, /interrupt, /cancel, /status, /sh <command>, /workspace <path>",
+    "/start, /help, /new, /resume, /continue, /interrupt, /cancel, /status, /sh <command>, /workspace <path>",
     "Telegram will also show the registered command list when you type /",
     "",
     "Codex slash commands supported in Telegram:",
@@ -142,6 +144,7 @@ export function codexSlashHelpText(): string {
     "/collab [mode]",
     "/agent, /subagents",
     "/resume",
+    "/continue [session-id]",
     "/review [base <branch>|commit <sha>|<custom instructions>]",
     "/rename <name>, /fork, /compact, /clear",
     "/diff, /copy, /mention <query>, /skills, /mcp, /apps, /plugins, /feedback, /verbose [on|off|status]",
