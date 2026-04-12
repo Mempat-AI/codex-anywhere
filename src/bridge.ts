@@ -113,6 +113,8 @@ export class CodexAnywhereBridge {
   readonly #codex: CodexClient;
   readonly #pendingApprovals = new Map<string, PendingApproval>();
   readonly #pendingShellCommands = new Map<string, { chatId: number; command: string }>();
+  readonly #pendingSessionSwitches = new Map<string, { chatId: number; threadId: string; targetWorkspace: string }>();
+  readonly #pendingSessionPages = new Map<string, { chatId: number; global: boolean; cursor: string }>();
   readonly #pendingInteractiveSessions = new Map<string, PendingInteractiveSession>();
   readonly #pendingInteractiveSessionByChat = new Map<number, string>();
   readonly #items = new Map<string, JsonObject>();
@@ -278,7 +280,7 @@ export class CodexAnywhereBridge {
           await this.#startNewThread(message.chat.id);
           return;
         case "resume":
-          await this.#showSessions(message.chat.id);
+          await this.#showSessions(message.chat.id, { global: false });
           return;
         case "interrupt":
           await this.#interruptTurn(message.chat.id);
@@ -436,7 +438,7 @@ export class CodexAnywhereBridge {
     this.#pendingShellCommands.delete(shellParsed.token);
     if (shellParsed.action === "cancel") {
       await this.#telegram.answerCallbackQuery(callback.id, "Cancelled");
-      await this.#sendText(pendingShell.chatId, "Cancelled shell command.");
+      await this.#sendText(pendingShell.chatId, "Cancelled.");
       return;
     }
 
@@ -496,6 +498,9 @@ export class CodexAnywhereBridge {
         return;
       case "collab":
         await this.#handleCollabCommand(chatId, args);
+        return;
+      case "continue":
+        await this.#handleContinueCommand(chatId, args);
         return;
       case "agent":
       case "subagents":
@@ -628,18 +633,7 @@ export class CodexAnywhereBridge {
     this.#config.workspaceCwd = targetPath;
     await saveConfig(this.#configPath, this.#config);
 
-    for (const state of Object.values(this.#state.chats)) {
-      state.threadId = null;
-      state.freshThread = false;
-      state.activeTurnId = null;
-      state.turnControlTurnId = null;
-      state.turnControlMessageId = null;
-      state.queueNextArmed = false;
-      state.queuedTurnInput = null;
-      state.pendingTurnInput = null;
-      state.pendingMention = null;
-      state.lastAssistantMessage = null;
-    }
+    this.#clearAllChatBindings();
     await this.#saveState();
 
     await this.#sendText(
@@ -1068,7 +1062,7 @@ export class CodexAnywhereBridge {
     state.freshThread = true;
     state.activeTurnId = null;
     await this.#saveState();
-    await this.#sendText(chatId, `🍴 Forked into a new thread.\nThread: ${threadId}`);
+    await this.#sendText(chatId, "Forked into new thread.");
   }
 
   async #runInitCommand(chatId: number): Promise<void> {
@@ -1105,9 +1099,7 @@ export class CodexAnywhereBridge {
       await this.#sendHtmlText(
         chatId,
         [
-          "<b>OMX command finished</b>",
-          `<code>${escapeTelegramHtml(renderedCommand)}</code>`,
-          "",
+          `<b>OMX</b>  <code>${escapeTelegramHtml(renderedCommand)}</code>`,
           `<pre>${escapeTelegramHtml(truncateOmxOutput(result.stdout || result.stderr || "(no output)"))}</pre>`,
         ].join("\n"),
       );
@@ -1130,9 +1122,7 @@ export class CodexAnywhereBridge {
       await this.#sendHtmlText(
         chatId,
         [
-          "<b>OMX command failed</b>",
-          `<code>${escapeTelegramHtml(renderedCommand)}</code>`,
-          "",
+          `<b>OMX failed</b>  <code>${escapeTelegramHtml(renderedCommand)}</code>`,
           `<pre>${escapeTelegramHtml(truncateOmxOutput(details || "(no output)"))}</pre>`,
         ].join("\n"),
       );
@@ -1142,7 +1132,7 @@ export class CodexAnywhereBridge {
   async #compactThread(chatId: number): Promise<void> {
     const threadId = await this.#resumeThread(chatId, true);
     await this.#codex.call("thread/compact/start", { threadId });
-    await this.#sendText(chatId, "🗜️ Requested thread compaction.");
+    await this.#sendText(chatId, "Compacting thread…");
   }
 
   async #startReview(chatId: number, args: string): Promise<void> {
@@ -1155,12 +1145,8 @@ export class CodexAnywhereBridge {
 
   async #runReview(chatId: number, target: JsonObject): Promise<void> {
     const threadId = await this.#resumeThread(chatId, true);
-    const result = await this.#codex.call("review/start", {
-      threadId,
-      target,
-    });
-    const reviewThreadId = asString(result.reviewThreadId) ?? threadId;
-    await this.#sendText(chatId, `🔍 Started review.\nReview thread: ${reviewThreadId}`);
+    await this.#codex.call("review/start", { threadId, target });
+    await this.#sendText(chatId, "Review started.");
   }
 
   async #renameThread(chatId: number, args: string): Promise<void> {
@@ -1413,10 +1399,7 @@ export class CodexAnywhereBridge {
 
   async #clearThread(chatId: number): Promise<void> {
     await this.#startNewThread(chatId, true);
-    await this.#sendText(
-      chatId,
-      "🧹 Started a fresh thread. Telegram message history remains visible, but Codex context is new.",
-    );
+    await this.#sendText(chatId, "Context cleared — fresh thread.");
   }
 
   async #sendGitDiff(chatId: number): Promise<void> {
@@ -1685,11 +1668,13 @@ export class CodexAnywhereBridge {
     await this.#startLocalSlashInteractiveSession(chatId, session);
   }
 
-  async #showSessions(chatId: number): Promise<void> {
+  async #showSessions(chatId: number, options: { global: boolean; cursor?: string | null }): Promise<void> {
     const currentThreadId = this.#chatState(chatId).threadId;
     const response = await this.#codex.call("thread/list", {
       limit: 8,
       sortKey: "updated_at",
+      ...(options.cursor ? { cursor: options.cursor } : {}),
+      ...(options.global ? {} : { cwd: this.#config.workspaceCwd }),
       sourceKinds: [
         "cli",
         "vscode",
@@ -1703,25 +1688,7 @@ export class CodexAnywhereBridge {
       ],
     });
     const threads = Array.isArray(response.data) ? [...response.data] : [];
-    if (
-      currentThreadId
-      && !threads.some(
-        (entry) =>
-          entry && typeof entry === "object" && asString((entry as JsonObject).id) === currentThreadId,
-      )
-    ) {
-      try {
-        const currentResponse = await this.#codex.call("thread/read", {
-          threadId: currentThreadId,
-          includeTurns: false,
-        });
-        if (currentResponse.thread && typeof currentResponse.thread === "object") {
-          threads.unshift(currentResponse.thread);
-        }
-      } catch (error) {
-        this.#logRuntimeError("thread/read current session", error);
-      }
-    }
+    const nextCursor = asString(response.nextCursor);
     if (threads.length === 0) {
       await this.#sendText(chatId, "No recent sessions were found.");
       return;
@@ -1739,7 +1706,12 @@ export class CodexAnywhereBridge {
       return 0;
     });
 
-    await this.#sendHtmlText(chatId, "<b>Sessions</b>");
+    await this.#sendHtmlText(
+      chatId,
+      options.cursor
+        ? (options.global ? "<b>More Sessions</b>" : "<b>More Sessions In This Workspace</b>")
+        : (options.global ? "<b>All Sessions</b>" : "<b>Sessions</b>"),
+    );
     for (const rawThread of threads) {
       if (!rawThread || typeof rawThread !== "object") {
         continue;
@@ -1761,7 +1733,7 @@ export class CodexAnywhereBridge {
               ]
             : [
                 {
-                  text: "Take Over",
+                  text: options.global ? "Continue" : "Take Over",
                   callback_data: formatSessionCallbackData("takeover", threadId),
                 },
                 {
@@ -1773,35 +1745,74 @@ export class CodexAnywhereBridge {
       } satisfies JsonObject;
       await this.#sendHtmlText(chatId, formatSessionCardHtml(thread, currentThreadId), replyMarkup);
     }
+    if (nextCursor) {
+      const token = randomBytes(4).toString("hex");
+      this.#pendingSessionPages.set(token, {
+        chatId,
+        global: options.global,
+        cursor: nextCursor,
+      });
+      const replyMarkup = {
+        inline_keyboard: [[{
+          text: "Load more sessions...",
+          callback_data: formatSessionCallbackData("more", token),
+        }]],
+      } satisfies JsonObject;
+      await this.#sendText(chatId, "Load more sessions...", replyMarkup);
+    }
   }
 
   async #handleSessionCallback(
     callbackQueryId: string,
     chatId: number | null,
-    parsed: { action: "takeover" | "status"; threadId: string },
+    parsed: { action: "takeover" | "status" | "confirmSwitch" | "cancelSwitch" | "more"; value: string },
   ): Promise<void> {
     if (chatId === null) {
       await this.#telegram.answerCallbackQuery(callbackQueryId, "Chat unavailable");
       return;
     }
 
-    if (parsed.action === "takeover") {
-      const state = this.#chatState(chatId);
-      state.threadId = parsed.threadId;
-      state.freshThread = false;
-      state.activeTurnId = null;
-      await this.#saveState();
-      await this.#codex.call("thread/resume", {
-        threadId: parsed.threadId,
-        ...threadSessionOverrides(this.#config, state),
+    if (parsed.action === "more") {
+      const pending = this.#pendingSessionPages.get(parsed.value);
+      if (!pending || pending.chatId !== chatId) {
+        await this.#telegram.answerCallbackQuery(callbackQueryId, "Session page expired");
+        return;
+      }
+      this.#pendingSessionPages.delete(parsed.value);
+      await this.#showSessions(chatId, {
+        global: pending.global,
+        cursor: pending.cursor,
       });
-      await this.#telegram.answerCallbackQuery(callbackQueryId, "Session taken over");
-      await this.#sendHtmlText(chatId, `Took over session <code>${escapeTelegramHtml(parsed.threadId)}</code>.`);
+      await this.#telegram.answerCallbackQuery(callbackQueryId, "Loading more");
+      return;
+    }
+
+    if (parsed.action === "confirmSwitch" || parsed.action === "cancelSwitch") {
+      const pending = this.#pendingSessionSwitches.get(parsed.value);
+      if (!pending || pending.chatId !== chatId) {
+        await this.#telegram.answerCallbackQuery(callbackQueryId, "Session switch expired");
+        return;
+      }
+      this.#pendingSessionSwitches.delete(parsed.value);
+      if (parsed.action === "cancelSwitch") {
+        await this.#telegram.answerCallbackQuery(callbackQueryId, "Cancelled");
+        await this.#sendText(chatId, "Cancelled workspace switch.");
+        return;
+      }
+      await this.#completeSessionTakeover(chatId, pending.threadId, pending.targetWorkspace);
+      await this.#telegram.answerCallbackQuery(callbackQueryId, "Workspace switched");
+      await this.#sendHtmlText(chatId, await this.#formatTakeoverMessage(pending.threadId, pending.targetWorkspace));
+      return;
+    }
+
+    if (parsed.action === "takeover") {
+      await this.#continueToSession(chatId, parsed.value);
+      await this.#telegram.answerCallbackQuery(callbackQueryId, "Handled");
       return;
     }
 
     const response = await this.#codex.call("thread/read", {
-      threadId: parsed.threadId,
+      threadId: parsed.value,
       includeTurns: false,
     });
     const thread = response.thread as JsonObject | undefined;
@@ -1811,6 +1822,144 @@ export class CodexAnywhereBridge {
     }
     await this.#telegram.answerCallbackQuery(callbackQueryId, "Showing session");
     await this.#sendHtmlText(chatId, formatSessionStatusHtml(thread, this.#chatState(chatId).threadId));
+  }
+
+  async #handleContinueCommand(chatId: number, args: string): Promise<void> {
+    const trimmed = args.trim();
+    if (!trimmed) {
+      await this.#showSessions(chatId, { global: true });
+      return;
+    }
+    if (trimmed.split(/\s+/).length !== 1) {
+      await this.#sendText(chatId, "Usage: /continue [exact-session-id]");
+      return;
+    }
+    if (!isSessionIdLike(trimmed)) {
+      await this.#sendText(chatId, "Usage: /continue [exact-session-id]");
+      return;
+    }
+    await this.#continueToSession(chatId, trimmed);
+  }
+
+  async #continueToSession(chatId: number, threadId: string): Promise<void> {
+    let response;
+    try {
+      response = await this.#codex.call("thread/read", {
+        threadId,
+        includeTurns: false,
+      });
+    } catch {
+      await this.#sendText(chatId, `Session unavailable: ${threadId}`);
+      return;
+    }
+    const thread = response.thread as JsonObject | undefined;
+    if (!thread) {
+      await this.#sendText(chatId, `Session unavailable: ${threadId}`);
+      return;
+    }
+    const targetWorkspace = asString(thread.cwd);
+    if (!targetWorkspace || targetWorkspace === this.#config.workspaceCwd) {
+      await this.#takeOverSession(chatId, threadId);
+      await this.#sendHtmlText(chatId, await this.#formatTakeoverMessage(threadId));
+      return;
+    }
+
+    const token = randomBytes(4).toString("hex");
+    this.#pendingSessionSwitches.set(token, { chatId, threadId, targetWorkspace });
+    const replyMarkup = {
+      inline_keyboard: [
+        [
+          {
+            text: "Switch Workspace + Continue",
+            callback_data: formatSessionCallbackData("confirmSwitch", token),
+          },
+          {
+            text: "Cancel",
+            callback_data: formatSessionCallbackData("cancelSwitch", token),
+          },
+        ],
+      ],
+    } satisfies JsonObject;
+    await this.#sendHtmlText(
+      chatId,
+      [
+        "<b>Continue session from another workspace?</b>",
+        `Current workspace: <code>${escapeTelegramHtml(this.#config.workspaceCwd)}</code>`,
+        `Target workspace: <code>${escapeTelegramHtml(targetWorkspace)}</code>`,
+        `Session: <code>${escapeTelegramHtml(threadId)}</code>`,
+      ].join("\n"),
+      replyMarkup,
+    );
+  }
+
+  async #takeOverSession(chatId: number, threadId: string): Promise<void> {
+    const previousState = structuredClone(this.#chatState(chatId));
+    const state = this.#chatState(chatId);
+    this.#resetChatSessionState(state);
+    state.threadId = threadId;
+    try {
+      await this.#codex.call("thread/resume", {
+        threadId,
+        ...threadSessionOverrides(this.#config, state),
+      });
+    } catch (error) {
+      if (!isMissingRolloutResumeError(error)) {
+        this.#state.chats[String(chatId)] = previousState;
+        await this.#saveState();
+        throw error;
+      }
+    }
+    await this.#saveState();
+  }
+
+  async #completeSessionTakeover(chatId: number, threadId: string, targetWorkspace: string): Promise<void> {
+    const previousWorkspace = this.#config.workspaceCwd;
+    const previousState = structuredClone(this.#state);
+    this.#config.workspaceCwd = targetWorkspace;
+    this.#clearAllChatBindings();
+    const state = this.#chatState(chatId);
+    this.#resetChatSessionState(state);
+    state.threadId = threadId;
+    try {
+      await this.#codex.call("thread/resume", {
+        threadId,
+        ...threadSessionOverrides(this.#config, state),
+      });
+    } catch (error) {
+      if (!isMissingRolloutResumeError(error)) {
+        this.#config.workspaceCwd = previousWorkspace;
+        this.#state = previousState;
+        throw error;
+      }
+    }
+    await saveConfig(this.#configPath, this.#config);
+    await this.#saveState();
+  }
+
+  async #formatTakeoverMessage(threadId: string, switchedWorkspace?: string): Promise<string> {
+    const lines: string[] = [];
+    if (switchedWorkspace) {
+      lines.push(`Switched workspace to <code>${escapeTelegramHtml(switchedWorkspace)}</code>.`);
+    }
+    lines.push(`Took over session <code>${escapeTelegramHtml(threadId)}</code>.`);
+
+    try {
+      const response = await this.#codex.call("thread/read", {
+        threadId,
+        includeTurns: true,
+      });
+      const preview = formatRecentTurnsPreview(response.thread as JsonObject | undefined, 3);
+      if (preview) {
+        lines.push("");
+        lines.push(preview);
+      }
+    } catch (error) {
+      if (!isThreadNotMaterializedError(error)) {
+        this.#logRuntimeError("thread/read takeover preview", error);
+      }
+    }
+
+    return lines.join("\n");
   }
 
   async #sendRolloutPath(chatId: number): Promise<void> {
@@ -2098,7 +2247,7 @@ export class CodexAnywhereBridge {
       }
       this.#stopTypingIndicator(chatId);
       const error = (params.error as JsonObject | undefined)?.message;
-      await this.#sendText(chatId, `❌ Error: ${typeof error === "string" ? error : "unknown error"}`);
+      await this.#sendHtmlText(chatId, `<b>Error</b>\n${escapeTelegramHtml(typeof error === "string" ? error : "unknown error")}`);
     }
   }
 
@@ -2136,7 +2285,7 @@ export class CodexAnywhereBridge {
     state.activeTurnId = null;
     await this.#saveState();
     if (!silent) {
-      await this.#sendText(chatId, `🆕 Started a fresh Codex thread.\nThread: ${threadId}`);
+      await this.#sendText(chatId, "New thread started.");
     }
     return threadId;
   }
@@ -2160,7 +2309,7 @@ export class CodexAnywhereBridge {
       }
     }
     if (!silent) {
-      await this.#sendText(chatId, `🔄 Resumed thread ${state.threadId}`);
+      await this.#sendText(chatId, "Thread resumed.");
     }
     return state.threadId;
   }
@@ -2178,7 +2327,7 @@ export class CodexAnywhereBridge {
       threadId: state.threadId,
       turnId: state.activeTurnId,
     });
-    await this.#sendText(chatId, `⏹️ Interrupt requested for ${state.activeTurnId}`);
+    await this.#sendText(chatId, "Interrupting turn…");
   }
 
   async #runShellCommand(chatId: number, command: string): Promise<void> {
@@ -2192,7 +2341,7 @@ export class CodexAnywhereBridge {
       inline_keyboard: [
         [
           {
-            text: "Run shell command",
+            text: "Run",
             callback_data: formatShellCallbackData(token, "run"),
           },
           {
@@ -2202,13 +2351,9 @@ export class CodexAnywhereBridge {
         ],
       ],
     } satisfies JsonObject;
-    await this.#sendText(
+    await this.#sendHtmlText(
       chatId,
-      [
-        "💻 Confirm explicit shell command.",
-        `Command: ${command}`,
-        "This adds an extra confirmation step before Codex runs it.",
-      ].join("\n"),
+      `<b>Run shell command?</b>\n<code>${escapeTelegramHtml(command)}</code>`,
       replyMarkup,
     );
   }
@@ -2253,22 +2398,20 @@ export class CodexAnywhereBridge {
       const message = error instanceof Error ? error.message : String(error);
       rateLimits = `error: ${message}`;
     }
+    const esc = escapeTelegramHtml;
+    const shortThread = state.threadId
+      ? (state.threadId.length > 12 ? state.threadId.slice(0, 8) : state.threadId)
+      : "none";
     const lines = [
-      `workspace: ${this.#config.workspaceCwd}`,
-      `owner: ${this.#config.ownerUserId ?? "unpaired"}`,
-      `thread: ${state.threadId ?? "none"}`,
-      `active turn: ${state.activeTurnId ?? "none"}`,
-      `model override: ${state.model ?? "(default)"}`,
-      `reasoning effort: ${state.reasoningEffort ?? "(default)"}`,
-      `personality: ${state.personality ?? "(default)"}`,
-      `collaboration mode: ${state.collaborationModeName ?? "(default)"}`,
-      `fast mode: ${state.serviceTier === "fast" ? "on" : "off"}`,
-      `verbose tool/file messages: ${state.verbose ? "on" : "off"}`,
-      `approval policy: ${state.approvalPolicy ?? "on-request"}`,
-      `rate limits: ${rateLimits}`,
-      `config: ${this.#configPath}`,
+      `<b>Status</b>`,
+      `workspace  <code>${esc(this.#config.workspaceCwd)}</code>`,
+      `thread  <code>${esc(shortThread)}</code>${state.activeTurnId ? "  ⚡ turn active" : ""}`,
+      `model  <code>${esc(state.model ?? "default")}${state.reasoningEffort ? ` (${state.reasoningEffort})` : ""}</code>`,
+      `fast  <code>${state.serviceTier === "fast" ? "on" : "off"}</code>`,
+      `approval  <code>${esc(state.approvalPolicy ?? "on-request")}</code>`,
+      `rate limits  ${esc(rateLimits)}`,
     ];
-    await this.#sendText(chatId, lines.join("\n"));
+    await this.#sendHtmlText(chatId, lines.join("\n"));
   }
 
   async #sendApprovalPrompt(chatId: number, token: string, method: string, params: JsonObject): Promise<void> {
@@ -2302,7 +2445,7 @@ export class CodexAnywhereBridge {
               scope: action === "session" ? "session" : "turn",
             };
       await this.#codex.respond(approval.requestId, result);
-      await this.#sendText(approval.chatId, `Permission decision sent: ${action}`);
+      await this.#sendText(approval.chatId, formatApprovalFeedback(action));
       return;
     }
 
@@ -2315,7 +2458,7 @@ export class CodexAnywhereBridge {
             ? "decline"
             : "cancel";
     await this.#codex.respond(approval.requestId, { decision });
-    await this.#sendText(approval.chatId, `Approval decision sent: ${decision}`);
+    await this.#sendText(approval.chatId, formatApprovalFeedback(action));
   }
 
   async #flushStream(stream: StreamBuffer, force: boolean): Promise<void> {
@@ -2468,13 +2611,9 @@ export class CodexAnywhereBridge {
       threadId,
       command,
     });
-    await this.#sendText(
+    await this.#sendHtmlText(
       chatId,
-      [
-        "💻 Submitted shell command.",
-        `Command: ${command}`,
-        "Note: /sh uses Codex's explicit shell-command flow.",
-      ].join("\n"),
+      `Running <code>${escapeTelegramHtml(command)}</code>`,
     );
   }
 
@@ -2864,6 +3003,25 @@ export class CodexAnywhereBridge {
     return this.#state.chats[key];
   }
 
+  #clearAllChatBindings(): void {
+    for (const state of Object.values(this.#state.chats)) {
+      this.#resetChatSessionState(state);
+    }
+  }
+
+  #resetChatSessionState(state: ChatSessionState): void {
+    state.threadId = null;
+    state.freshThread = false;
+    state.activeTurnId = null;
+    state.turnControlTurnId = null;
+    state.turnControlMessageId = null;
+    state.queueNextArmed = false;
+    state.queuedTurnInput = null;
+    state.pendingTurnInput = null;
+    state.pendingMention = null;
+    state.lastAssistantMessage = null;
+  }
+
   #findChatIdByThread(threadId: string): number | null {
     for (const [chatId, state] of Object.entries(this.#state.chats)) {
       if (state.threadId === threadId) {
@@ -2897,6 +3055,64 @@ function clampTelegramText(text: string): string {
   return "…\n\n" + text.slice(-(3900 - 3));
 }
 
+function formatRecentTurnsPreview(thread: JsonObject | undefined, limit: number): string | null {
+  const turns = Array.isArray(thread?.turns) ? thread.turns : [];
+  const recent = turns
+    .filter((turn): turn is JsonObject => typeof turn === "object" && turn !== null && !Array.isArray(turn))
+    .slice(-limit);
+  if (recent.length === 0) {
+    return null;
+  }
+
+  const lines = ["<b>Recent History</b>"];
+  for (const turn of recent) {
+    const userText = extractTurnUserText(turn);
+    const assistantText = extractTurnAssistantText(turn);
+    lines.push(`• <b>User:</b> ${escapeTelegramHtml(truncatePreview(userText ?? "(no user text)"))}`);
+    lines.push(`  <b>Assistant:</b> ${escapeTelegramHtml(truncatePreview(assistantText ?? "(no assistant text)"))}`);
+  }
+  return lines.join("\n");
+}
+
+function extractTurnUserText(turn: JsonObject): string | null {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  for (const item of items) {
+    if (!item || typeof item !== "object" || (item as JsonObject).type !== "userMessage") {
+      continue;
+    }
+    const content = Array.isArray((item as JsonObject).content) ? (item as JsonObject).content as JsonObject[] : [];
+    const texts = content
+      .map((entry) => asString(entry.text))
+      .filter((value): value is string => Boolean(value));
+    if (texts.length > 0) {
+      return texts.join(" ");
+    }
+  }
+  return null;
+}
+
+function extractTurnAssistantText(turn: JsonObject): string | null {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    if ((item as JsonObject).type === "agentMessage") {
+      const text = asString((item as JsonObject).text);
+      if (text) {
+        return text;
+      }
+    }
+  }
+  return null;
+}
+
+function truncatePreview(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length > 160 ? `${normalized.slice(0, 160)}…` : normalized;
+}
+
 function resolveWorkspacePath(input: string, currentWorkspace: string, homeDir: string): string {
   const trimmed = input.trim();
   if (!trimmed) {
@@ -2928,17 +3144,6 @@ function truncateOmxOutput(text: string): string {
   return normalized.length > 3200 ? `${normalized.slice(0, 3200)}\n…` : normalized;
 }
 
-function formatWorkspaceScopeText(cwd: string): string {
-  const home = os.homedir();
-  if (cwd === home) {
-    return "~";
-  }
-  if (cwd.startsWith(`${home}${path.sep}`)) {
-    return `~${cwd.slice(home.length)}`;
-  }
-  return cwd;
-}
-
 function asString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
@@ -2959,6 +3164,15 @@ function isMissingExecutableError(error: unknown, command: string): boolean {
 function isMissingRolloutResumeError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return message.toLowerCase().includes("no rollout found for thread id");
+}
+
+function isSessionIdLike(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isThreadNotMaterializedError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.toLowerCase().includes("is not materialized yet");
 }
 
 function autoDeclineResult(method: string): JsonObject {
@@ -3072,32 +3286,45 @@ function formatRateLimitSnapshot(snapshot: JsonObject | undefined): string {
 function formatSessionCardHtml(thread: JsonObject, currentThreadId: string | null): string {
   const threadId = asString(thread.id) ?? "<unknown>";
   const isCurrent = currentThreadId === threadId;
-  const title =
+  const rawTitle =
     asString(thread.name)
     ?? formatThreadOptionLabel(thread)
     ?? asString(thread.preview)
     ?? threadId;
-  const updatedAt = typeof thread.updatedAt === "number" ? relativeTime(thread.updatedAt) : "unknown";
-  const status = formatThreadStatus(thread.status as JsonObject | undefined);
-  const source = asString(thread.source) ?? "unknown";
+  const title = rawTitle.length > 60 ? rawTitle.slice(0, 59) + "…" : rawTitle;
+  const gitInfo = thread.gitInfo && typeof thread.gitInfo === "object"
+    ? (thread.gitInfo as JsonObject)
+    : null;
+  const branch =
+    asString(thread.gitBranch)
+    ?? asString(thread.branch)
+    ?? asString(gitInfo?.branch)
+    ?? null;
+  const updatedAt = typeof thread.updatedAt === "number" ? relativeTime(thread.updatedAt) : "";
+  const rawStatus = formatThreadStatus(thread.status as JsonObject | undefined);
+  const source = formatSourceLabel(asString(thread.source));
   const header = isCurrent
-    ? `● <b>${escapeTelegramHtml(title)}</b>`
-    : `○ <b>${escapeTelegramHtml(title)}</b>`;
-  return [
-    header,
-    `<code>${escapeTelegramHtml(threadId)}</code>`,
-    `${escapeTelegramHtml(updatedAt)}  ·  ${escapeTelegramHtml(status)}  ·  ${escapeTelegramHtml(source)}`,
-  ].join("\n");
+    ? `▶ <b>${escapeTelegramHtml(title)}</b>`
+    : `<b>${escapeTelegramHtml(title)}</b>`;
+  const lines = [header];
+  if (branch) {
+    lines.push(`↳ <code>${escapeTelegramHtml(branch)}</code>`);
+  }
+  lines.push(`<code>${escapeTelegramHtml(threadId)}</code>`);
+  const metaParts = [statusBadge(rawStatus), updatedAt, source].filter(Boolean);
+  lines.push(metaParts.join("  ·  "));
+  return lines.join("\n");
 }
 
 function formatSessionStatusHtml(thread: JsonObject, currentThreadId: string | null): string {
   const threadId = asString(thread.id) ?? "<unknown>";
   const preview = asString(thread.preview) ?? "";
-  const rolloutPath = asString(thread.path) ?? "(unavailable)";
+  const rolloutPath = asString(thread.path) ?? "";
   return [
     formatSessionCardHtml(thread, currentThreadId),
-    preview ? `Preview: ${escapeTelegramHtml(preview)}` : "",
-    `Rollout: <code>${escapeTelegramHtml(rolloutPath)}</code>`,
+    `<code>${escapeTelegramHtml(threadId)}</code>`,
+    preview ? escapeTelegramHtml(preview) : "",
+    rolloutPath ? `Rollout: <code>${escapeTelegramHtml(rolloutPath)}</code>` : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -3119,6 +3346,44 @@ function formatThreadStatus(status: JsonObject | undefined): string {
   }
   const activeFlags = Array.isArray(status?.activeFlags) ? status.activeFlags.join(", ") : "";
   return activeFlags ? `active (${activeFlags})` : "active";
+}
+
+function formatApprovalFeedback(action: "approve" | "session" | "decline" | "cancel"): string {
+  switch (action) {
+    case "approve": return "✓ Approved.";
+    case "session": return "✓ Approved for session.";
+    case "decline": return "Declined.";
+    case "cancel": return "Cancelled.";
+  }
+}
+
+function statusBadge(rawStatus: string): string {
+  if (rawStatus.startsWith("active")) {
+    const working = rawStatus.includes("tool-use");
+    return working ? "🔧 working" : "⚡ active";
+  }
+  switch (rawStatus) {
+    case "completed": return "✓ done";
+    case "failed": return "✗ failed";
+    case "notLoaded": return "💤 idle";
+    default: return rawStatus;
+  }
+}
+
+function formatSourceLabel(source: string | null): string {
+  switch (source) {
+    case "vscode": return "VS Code";
+    case "cli": return "CLI";
+    case "appServer": return "App";
+    case "subAgent":
+    case "subAgentReview":
+    case "subAgentCompact":
+    case "subAgentThreadSpawn":
+    case "subAgentOther":
+      return "Agent";
+    case "exec": return "Exec";
+    default: return source ?? "";
+  }
 }
 
 function relativeTime(unixSeconds: number): string {
@@ -3223,7 +3488,8 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "help", description: "show bot and Codex slash commands" },
     { command: "status", description: "show current thread and model settings" },
     { command: "new", description: "start a fresh Codex thread" },
-    { command: "resume", description: "browse and continue recent sessions" },
+    { command: "resume", description: "browse and continue sessions in this workspace" },
+    { command: "continue", description: "browse all sessions or continue by exact id" },
     { command: "interrupt", description: "interrupt the active turn" },
     { command: "esc", description: "interrupt the active turn" },
     { command: "cancel", description: "cancel the active interactive prompt" },

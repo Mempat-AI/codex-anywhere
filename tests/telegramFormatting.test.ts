@@ -74,7 +74,18 @@ test("formatApprovalPromptHtml escapes dangerous command text", () => {
     new Map(),
   );
 
+  assert.match(html, /Approve command\?/);
   assert.match(html, /<code>cat &lt;secret&gt;<\/code>/);
+});
+
+test("formatApprovalPromptHtml omits empty reason", () => {
+  const html = formatApprovalPromptHtml(
+    "item/commandExecution/requestApproval",
+    { command: "ls", cwd: "/tmp", reason: "" },
+    new Map(),
+  );
+
+  assert.doesNotMatch(html, /reason/);
 });
 
 test("formatTurnCompletionHtml returns null on success", () => {

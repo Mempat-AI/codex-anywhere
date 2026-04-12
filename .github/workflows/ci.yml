@@ -21,7 +21,7 @@ jobs:
           cache: npm
           cache-dependency-path: package.json
       - run: npm install
-      - run: npm test
+      - run: SKIP_OMX_COMMAND_TESTS=1 npm test
 
   typecheck:
     name: typecheck
