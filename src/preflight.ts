@@ -1,11 +1,14 @@
 import { spawnSync } from "node:child_process";
 
+import { normalizeConfig } from "./configModel.js";
 import { TelegramBotApi } from "./telegram.js";
 import type { StoredConfig } from "./types.js";
 
 export async function runPreflightChecks(config: StoredConfig): Promise<void> {
   assertCodexAvailable();
-  await assertTelegramTokenWorks(config.telegramBotToken);
+  for (const bot of normalizeConfig(config)) {
+    await assertTelegramTokenWorks(bot.telegramBotToken);
+  }
 }
 
 function assertCodexAvailable(): void {

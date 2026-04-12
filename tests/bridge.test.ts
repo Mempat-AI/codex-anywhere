@@ -6,7 +6,9 @@ import test from "node:test";
 
 import { CodexAnywhereBridge } from "../src/bridge.js";
 import { loadConfig, loadState, saveConfig, saveState } from "../src/persistence.js";
+import { InMemorySessionOwnershipRegistry } from "../src/sessionOwnership.js";
 import type {
+  BotRuntimeConfig,
   JsonObject,
   StoredConfig,
   StoredState,
@@ -92,11 +94,15 @@ class FakeCodexWithFreshResumeFailure extends FakeCodex {
   }
 }
 
-function testConfig(overrides: Partial<StoredConfig> = {}): StoredConfig {
+function testConfig(
+  overrides: Partial<StoredConfig & BotRuntimeConfig> = {},
+): StoredConfig & BotRuntimeConfig {
   return {
     version: 1,
+    id: "default",
+    label: "default",
     telegramBotToken: "test-token",
-    workspaceCwd: "/Users/twocode/works/agents/codex",
+    workspaceCwd: process.cwd(),
     ownerUserId: 1,
     pollTimeoutSeconds: 1,
     streamEditIntervalMs: 100,
@@ -329,7 +335,7 @@ test("bridge switches workspace and clears chat thread state", async () => {
   assert.match(telegram.sentMessages[0]!.text, /Detached current thread\/session state/);
 });
 
-test("bridge starts the first turn on a fresh thread without thread/resume", async () => {
+test("bridge recreates a fresh thread when resume reports a missing rollout", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodexWithFreshResumeFailure();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
@@ -342,8 +348,10 @@ test("bridge starts the first turn on a fresh thread without thread/resume", asy
   await bridge.handleUpdateForTest(telegramMessageUpdate("Commit current changes"));
 
   assert.equal(codex.calls[0]!.method, "thread/start");
-  assert.equal(codex.calls[1]!.method, "turn/start");
-  assert.deepEqual(codex.calls[1]!.params?.input, [
+  assert.equal(codex.calls[1]!.method, "thread/resume");
+  assert.equal(codex.calls[2]!.method, "thread/start");
+  assert.equal(codex.calls[3]!.method, "turn/start");
+  assert.deepEqual(codex.calls[3]!.params?.input, [
     { type: "text", text: "Commit current changes" },
   ]);
 });
@@ -697,4 +705,68 @@ test("cancelling cross-workspace /continue preserves the current workspace and t
   assert.equal(savedState.chats["42"]?.threadId, "thread-1");
   assert.equal(codex.calls.length, 1);
   assert.equal(telegram.callbackAnswers.at(-1), "Cancelled");
+});
+
+test("session ownership lock prevents a second bot from taking over the same session", async () => {
+  const registry = new InMemorySessionOwnershipRegistry();
+  const threadId = "019d6fef-786e-74a1-a59b-400820c026b0";
+
+  const telegramA = new FakeTelegram();
+  const codexA = new FakeCodex();
+  codexA.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/read") {
+      return { thread: { id: threadId, cwd: process.cwd(), updatedAt: 1, status: { type: "idle" }, source: "cli" } };
+    }
+    if (method === "thread/resume") {
+      return {};
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridgeA = new CodexAnywhereBridge(
+    testConfig({ id: "bot-a", label: "bot-a" }),
+    "/tmp/config-a.json",
+    "/tmp/state-a.json",
+    {
+      telegram: telegramA,
+      codex: codexA,
+      initialState: testState(),
+      botId: "bot-a",
+      botLabel: "bot-a",
+      sessionOwnership: registry,
+    },
+  );
+
+  const telegramB = new FakeTelegram();
+  const codexB = new FakeCodex();
+  codexB.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/read") {
+      return { thread: { id: threadId, cwd: process.cwd(), updatedAt: 1, status: { type: "idle" }, source: "cli" } };
+    }
+    if (method === "thread/resume") {
+      return {};
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridgeB = new CodexAnywhereBridge(
+    testConfig({ id: "bot-b", label: "bot-b" }),
+    "/tmp/config-b.json",
+    "/tmp/state-b.json",
+    {
+      telegram: telegramB,
+      codex: codexB,
+      initialState: testState(),
+      botId: "bot-b",
+      botLabel: "bot-b",
+      sessionOwnership: registry,
+    },
+  );
+
+  await bridgeA.handleUpdateForTest(telegramMessageUpdate(`/continue ${threadId}`));
+  await bridgeB.handleUpdateForTest(telegramMessageUpdate(`/continue ${threadId}`));
+
+  assert.equal(codexA.calls.some((call) => call.method === "thread/resume"), true);
+  assert.equal(codexB.calls.some((call) => call.method === "thread/resume"), false);
+  assert.match(telegramB.sentMessages.at(-1)!.text, /already owned by Telegram bot bot-a/);
 });

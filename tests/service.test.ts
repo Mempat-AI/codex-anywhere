@@ -296,3 +296,49 @@ test("install-service on linux writes a user unit and enables it", async () => {
   ]);
   assert.match(savedLogs.join("\n"), /Installed systemd user service/);
 });
+
+test("service-status lists configured multi-bot definitions", async () => {
+  const logs: string[] = [];
+
+  await runBackgroundServiceCommand("service-status", {
+    platform: "darwin",
+    homeDir: "/tmp/home",
+    uid: 501,
+    storagePaths: {
+      configPath: "/tmp/codex-anywhere/config.json",
+      statePath: "/tmp/codex-anywhere/state.json",
+    },
+    loadConfig: async () => ({
+      version: 2,
+      bots: [
+        {
+          id: "bot-a",
+          label: "Bot A",
+          telegramBotToken: "token-a",
+          workspaceCwd: "/tmp/workspace-a",
+          ownerUserId: 1,
+          pollTimeoutSeconds: 20,
+          streamEditIntervalMs: 1500,
+        },
+        {
+          id: "bot-b",
+          label: "Bot B",
+          telegramBotToken: "token-b",
+          workspaceCwd: "/tmp/workspace-b",
+          ownerUserId: 1,
+          pollTimeoutSeconds: 20,
+          streamEditIntervalMs: 1500,
+        },
+      ],
+    }),
+    execFile: async () => ({ stdout: "", stderr: "" }),
+    log: (message) => {
+      logs.push(message);
+    },
+  });
+
+  const combined = logs.join("\n");
+  assert.match(combined, /configured-bots: 2/);
+  assert.match(combined, /bot bot-a: workspace=\/tmp\/workspace-a/);
+  assert.match(combined, /bot bot-b: workspace=\/tmp\/workspace-b/);
+});

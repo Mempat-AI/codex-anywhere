@@ -58,6 +58,15 @@ Workspace path for Codex tasks [/current/dir]:  ← press Enter to accept
 
 The workspace defaults to wherever you run `connect` from. The setup validates the token, checks that `codex` is on `PATH`, and starts the bridge.
 
+### Add another Telegram bot
+
+```bash
+codex-anywhere add-bot
+```
+
+This appends one bot definition to the shared config. After saving, restart the service or rerun `connect` to launch the new bot.
+If your install still uses the older single-bot config, run `codex-anywhere connect` once first so it can migrate to the current protocol.
+
 ### 4. Install the background service
 
 ```bash
@@ -100,6 +109,11 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 - run `$deep-interview`, `$autopilot`, and other OMX skills directly in the chat
 - use `/omx status`, `/omx doctor`, and other CLI commands via `/omx <args>`
 
+**Add another bot from Telegram:**
+- send `/addbot` from the currently paired admin bot
+- reply with bot id, label, BotFather token, and workspace path
+- the new bot is added to shared config and started immediately in the running supervisor
+
 ## Service Management
 
 ```bash
@@ -108,6 +122,7 @@ codex-anywhere uninstall-service
 ```
 
 Logs are written to `logs/` under the Codex Anywhere storage root (`CODEX_ANYWHERE_HOME`).
+Multi-bot installs also keep bot state under `bots/<bot-id>/state.json` and shared session ownership in `session-ownership.json`.
 
 ## Telegram Commands
 
@@ -116,6 +131,7 @@ Telegram-native:
 | Command | Description |
 |---|---|
 | `/workspace <path>` | Show or change the bot workspace |
+| `/addbot` | Add and start another Telegram bot from chat |
 | `/resume` | Browse and continue sessions in the current workspace |
 | `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
 | `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
@@ -124,7 +140,7 @@ Telegram-native:
 
 Codex commands supported through the bridge:
 
-`/start` `/help` `/new` `/resume` `/continue` `/interrupt` `/cancel` `/status` `/sh` `/model` `/fast` `/personality` `/permissions` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
+`/start` `/help` `/new` `/resume` `/continue` `/interrupt` `/cancel` `/status` `/sh` `/workspace` `/addbot` `/model` `/fast` `/personality` `/permissions` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
 
 ## Development
 
@@ -135,6 +151,7 @@ git clone https://github.com/Mempat-AI/codex-anywhere
 cd codex-anywhere
 pnpm install
 pnpm run connect   # runs directly from src/ via tsx
+pnpm run add-bot   # appends a new bot definition to config
 ```
 
 Run checks:

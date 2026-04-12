@@ -1,11 +1,12 @@
 import process from "node:process";
 
 import { CodexAnywhereBridge } from "./bridge.js";
+import { normalizeConfig } from "./configModel.js";
 import { runSetupWizard } from "./onboarding.js";
 import { getStoragePaths } from "./paths.js";
 import { loadConfig, saveConfig } from "./persistence.js";
 import { runPreflightChecks } from "./preflight.js";
-import type { StoragePaths } from "./types.js";
+import type { BotRuntimeConfig, StoragePaths } from "./types.js";
 
 export interface BootstrapCodexAnywhereDeps {
   cwd?: string;
@@ -14,7 +15,7 @@ export interface BootstrapCodexAnywhereDeps {
   saveConfig?: typeof saveConfig;
   runSetupWizard?: typeof runSetupWizard;
   runPreflightChecks?: typeof runPreflightChecks;
-  createBridge?: (config: NonNullable<Awaited<ReturnType<typeof loadConfig>>>, configPath: string, statePath: string) => CodexAnywhereBridge;
+  createBridge?: (config: BotRuntimeConfig, configPath: string, statePath: string) => CodexAnywhereBridge;
   log?: (message: string) => void;
 }
 
@@ -46,7 +47,11 @@ export async function bootstrapCodexAnywhere(
 
   await preflightChecks(config);
 
-  const bridge = createBridge(config, configPath, statePath);
+  const [botConfig] = normalizeConfig(config);
+  if (!botConfig) {
+    throw new Error("Codex Anywhere config does not define any bots.");
+  }
+  const bridge = createBridge(botConfig, configPath, statePath);
   await bridge.initialize();
   return {
     bridge,

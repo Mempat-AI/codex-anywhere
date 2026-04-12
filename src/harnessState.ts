@@ -1,3 +1,4 @@
+import { normalizeConfig } from "./configModel.js";
 import path from "node:path";
 
 import { getStoragePaths } from "./paths.js";
@@ -23,7 +24,11 @@ export async function readLaunchRestoreStatus(
 ): Promise<LaunchRestoreStatus> {
   const normalizedWorkspace = path.resolve(workspaceCwd);
   const config = await loadConfig(storagePaths.configPath);
-  const configuredWorkspaceCwd = config?.workspaceCwd ? path.resolve(config.workspaceCwd) : null;
+  const configuredWorkspaceCwd = config
+    ? normalizeConfig(config)
+      .map((bot) => path.resolve(bot.workspaceCwd))
+      .find((candidate) => candidate === normalizedWorkspace) ?? null
+    : null;
   const sameWorkspace = configuredWorkspaceCwd === normalizedWorkspace;
 
   if (!config || !sameWorkspace) {

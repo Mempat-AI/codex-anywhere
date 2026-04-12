@@ -1,10 +1,12 @@
 import type {
+  BotRuntimeConfig,
   ChatSessionState,
   JsonObject,
   PendingInteractiveSessionStep,
 } from "./types.js";
 
 export type LocalInteractiveCommand =
+  | "addbot"
   | "model"
   | "fast"
   | "permissions"
@@ -23,6 +25,41 @@ export interface LocalInteractiveSessionSpec {
   title: string;
   steps: PendingInteractiveSessionStep[];
   meta: JsonObject;
+}
+
+export function buildAddBotInteractiveSession(
+  config: BotRuntimeConfig,
+): LocalInteractiveSessionSpec {
+  return {
+    title: "Add a Telegram bot.",
+    steps: [
+      {
+        key: "botId",
+        prompt: "Reply with a unique bot id (for example: bot-2).",
+        kind: "text",
+        required: true,
+      },
+      {
+        key: "label",
+        prompt: "Reply with a human label, or send - to reuse the bot id.",
+        kind: "text",
+        required: true,
+      },
+      {
+        key: "telegramBotToken",
+        prompt: "Reply with the new Telegram bot token from BotFather.",
+        kind: "text",
+        required: true,
+      },
+      {
+        key: "workspaceCwd",
+        prompt: `Reply with the workspace path for this bot [${config.workspaceCwd}].`,
+        kind: "text",
+        required: true,
+      },
+    ],
+    meta: { command: "addbot" },
+  };
 }
 
 export function buildModelInteractiveSession(

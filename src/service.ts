@@ -8,6 +8,7 @@ import process from "node:process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import { summarizeConfiguredBots } from "./configModel.js";
 import { prepareCodexAnywhereConfig } from "./configuration.js";
 import { getStoragePaths } from "./paths.js";
 import { loadConfig } from "./persistence.js";
@@ -259,46 +260,46 @@ export async function runBackgroundServiceCommand(
       },
     });
 
-    switch (command) {
-      case "install-service":
-        await prepareCodexAnywhereConfig({
-          cwd,
-          env,
-          storagePaths,
-          loadConfig: options.loadConfig,
-          saveConfig: options.saveConfig,
-          runSetupWizard: options.runSetupWizard,
-          runPreflightChecks: options.runPreflightChecks,
-          log,
-        });
-        await installLaunchAgent(spec, execFile);
-        log(`Installed LaunchAgent ${spec.label}`);
-        log(`Plist: ${spec.plistPath}`);
-        log(`Logs: ${spec.stdoutPath}`);
+  switch (command) {
+    case "install-service":
+      await prepareCodexAnywhereConfig({
+        cwd,
+        env,
+        storagePaths,
+        loadConfig: options.loadConfig,
+        saveConfig: options.saveConfig,
+        runSetupWizard: options.runSetupWizard,
+        runPreflightChecks: options.runPreflightChecks,
+        log,
+        allowSetupWizard: true,
+      });
+      await installLaunchAgent(spec, execFile);
+      log(`Installed LaunchAgent ${spec.label}`);
+      log(`Plist: ${spec.plistPath}`);
+      log(`Logs: ${spec.stdoutPath}`);
+      return;
+    case "start-service":
+      await assertLaunchAgentInstalled(spec);
+      if (!existingConfig) {
+        throw new Error(
+          "Codex Anywhere is not configured yet. Run `npm run connect` or `pnpm run connect` once before starting the service.",
+        );
+      }
+      await startLaunchAgent(spec, execFile);
+      log(`Started LaunchAgent ${spec.label}`);
+      return;
+    case "stop-service":
+      await assertLaunchAgentInstalled(spec);
+      await stopLaunchAgent(spec, execFile);
+      log(`Stopped LaunchAgent ${spec.label}`);
+      return;
+    case "service-status":
+      await printLaunchAgentStatus(spec, execFile, log, existingConfig);
         return;
-      case "start-service":
-        await assertLaunchAgentInstalled(spec);
-        if (!existingConfig) {
-          throw new Error(
-            "Codex Anywhere is not configured yet. Run `npm run connect` or `pnpm run connect` once before starting the service.",
-          );
-        }
-        await startLaunchAgent(spec, execFile);
-        log(`Started LaunchAgent ${spec.label}`);
-        return;
-      case "stop-service":
-        await assertLaunchAgentInstalled(spec);
-        await stopLaunchAgent(spec, execFile);
-        log(`Stopped LaunchAgent ${spec.label}`);
-        return;
-      case "service-status":
-        await printLaunchAgentStatus(spec, execFile, log);
-        return;
-      case "uninstall-service":
-        await uninstallLaunchAgent(spec, execFile);
-        log(`Removed LaunchAgent ${spec.label}`);
-        return;
-    }
+    case "uninstall-service":
+      await uninstallLaunchAgent(spec, execFile);
+      log(`Removed LaunchAgent ${spec.label}`);
+      return;
   }
 
   if (platform === "linux") {
@@ -328,6 +329,7 @@ export async function runBackgroundServiceCommand(
           runSetupWizard: options.runSetupWizard,
           runPreflightChecks: options.runPreflightChecks,
           log,
+          allowSetupWizard: true,
         });
         await installLinuxSystemdUnit(spec, execFile);
         log(`Installed systemd user service ${spec.serviceName}`);
@@ -350,7 +352,7 @@ export async function runBackgroundServiceCommand(
         log(`Stopped systemd user service ${spec.serviceName}`);
         return;
       case "service-status":
-        await printLinuxSystemdStatus(spec, execFile, log);
+        await printLinuxSystemdStatus(spec, execFile, log, existingConfig);
         return;
       case "uninstall-service":
         await uninstallLinuxSystemdUnit(spec, execFile);
@@ -414,6 +416,7 @@ async function printLaunchAgentStatus(
   spec: LaunchAgentSpec,
   execFile: ServiceExecFile,
   log: (message: string) => void,
+  config: StoredConfig | null,
 ): Promise<void> {
   const installed = await fileExists(spec.plistPath);
   const loaded = await runLaunchctl(execFile, ["print", spec.serviceTarget], {
@@ -429,6 +432,13 @@ async function printLaunchAgentStatus(
     `stdout-log: ${spec.stdoutPath}`,
     `stderr-log: ${spec.stderrPath}`,
   ];
+  if (config) {
+    const bots = summarizeConfiguredBots(config);
+    lines.push(`configured-bots: ${bots.length}`);
+    for (const bot of bots) {
+      lines.push(`bot ${bot.id}: workspace=${bot.workspaceCwd}`);
+    }
+  }
   if (loaded.stdout.trim()) {
     lines.push("");
     lines.push("launchctl print:");
@@ -483,6 +493,7 @@ async function printLinuxSystemdStatus(
   spec: LinuxSystemdServiceSpec,
   execFile: ServiceExecFile,
   log: (message: string) => void,
+  config: StoredConfig | null,
 ): Promise<void> {
   const installed = await fileExists(spec.unitPath);
   const active = await runSystemctl(execFile, ["--user", "is-active", spec.serviceName], {
@@ -505,6 +516,13 @@ async function printLinuxSystemdStatus(
     `stdout-log: ${spec.stdoutPath}`,
     `stderr-log: ${spec.stderrPath}`,
   ];
+  if (config) {
+    const bots = summarizeConfiguredBots(config);
+    lines.push(`configured-bots: ${bots.length}`);
+    for (const bot of bots) {
+      lines.push(`bot ${bot.id}: workspace=${bot.workspaceCwd}`);
+    }
+  }
   if (detail.stdout.trim()) {
     lines.push("");
     lines.push("systemctl --user status:");

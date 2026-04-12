@@ -94,7 +94,7 @@ function testConfig(overrides: Partial<StoredConfig> = {}): StoredConfig {
   return {
     version: 1,
     telegramBotToken: "test-token",
-    workspaceCwd: "/Users/twocode/works/agents/codex",
+    workspaceCwd: process.cwd(),
     ownerUserId: 1,
     pollTimeoutSeconds: 1,
     streamEditIntervalMs: 100,

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 
-import type { StoredConfig } from "./types.js";
+import type { BotRuntimeConfig, StoredConfig } from "./types.js";
 
 export async function runSetupWizard(defaultWorkspaceCwd: string): Promise<StoredConfig> {
   const rl = readline.createInterface({
@@ -24,12 +24,57 @@ export async function runSetupWizard(defaultWorkspaceCwd: string): Promise<Store
     }
 
     return {
-      version: 1,
+      version: 2,
+      bots: [
+        {
+          id: "default",
+          label: "default",
+          telegramBotToken,
+          workspaceCwd,
+          ownerUserId: null,
+          pollTimeoutSeconds: 20,
+          streamEditIntervalMs: 1500,
+        },
+      ],
+    };
+  } finally {
+    rl.close();
+  }
+}
+
+export async function runAddBotWizard(
+  defaultWorkspaceCwd: string,
+  defaults: Partial<BotRuntimeConfig> = {},
+): Promise<BotRuntimeConfig> {
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    console.log("Add a Telegram bot to Codex Anywhere.");
+    console.log("This appends one bot definition to the shared supervisor config.\n");
+
+    const defaultBotId = defaults.id ?? "bot-2";
+    const botId = await promptForDefault(rl, `Bot id [${defaultBotId}]: `, defaultBotId);
+    const labelInput = (await rl.question(`Bot label [${defaults.label ?? botId}]: `)).trim();
+    const telegramBotToken = await promptForRequired(rl, "Telegram bot token (from BotFather): ");
+    const workspacePrompt = `Workspace path for this bot [${defaultWorkspaceCwd}]: `;
+    const workspaceInput = (await rl.question(workspacePrompt)).trim();
+    const workspaceCwd = path.resolve(workspaceInput || defaultWorkspaceCwd);
+
+    if (!fs.existsSync(workspaceCwd)) {
+      throw new Error(`Workspace path does not exist: ${workspaceCwd}`);
+    }
+
+    return {
+      id: botId,
+      label: labelInput || defaults.label || botId,
       telegramBotToken,
       workspaceCwd,
-      ownerUserId: null,
-      pollTimeoutSeconds: 20,
-      streamEditIntervalMs: 1500,
+      ownerUserId: defaults.ownerUserId ?? null,
+      pollTimeoutSeconds: defaults.pollTimeoutSeconds ?? 20,
+      streamEditIntervalMs: defaults.streamEditIntervalMs ?? 1500,
     };
   } finally {
     rl.close();
@@ -47,4 +92,13 @@ async function promptForRequired(
     }
     console.log("This field is required.");
   }
+}
+
+async function promptForDefault(
+  rl: readline.Interface,
+  question: string,
+  fallback: string,
+): Promise<string> {
+  const answer = (await rl.question(question)).trim();
+  return answer || fallback;
 }

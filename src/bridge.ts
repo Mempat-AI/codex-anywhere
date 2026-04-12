@@ -21,6 +21,7 @@ import {
 } from "./interactive.js";
 import {
   buildAgentThreadInteractiveSession,
+  buildAddBotInteractiveSession,
   buildApprovalPolicyInteractiveSession,
   buildCollaborationInteractiveSession,
   buildExperimentalInteractiveSession,
@@ -36,6 +37,7 @@ import {
   buildVerboseInteractiveSession,
 } from "./localCommandInteractions.js";
 import { loadState, saveConfig, saveState } from "./persistence.js";
+import type { SessionOwnershipRegistry } from "./sessionOwnership.js";
 import { formatSessionCallbackData, parseSessionCallbackData } from "./sessions.js";
 import {
   codexSlashHelpText,
@@ -65,12 +67,12 @@ import {
   parseTurnControlCallbackData,
 } from "./turnControls.js";
 import type {
+  BotRuntimeConfig,
   ChatSessionState,
   JsonObject,
   PendingApproval,
   PendingInteractiveSession,
   PendingInteractiveSessionStep,
-  StoredConfig,
   StoredState,
   StreamBuffer,
   TelegramBotCommand,
@@ -103,14 +105,24 @@ export interface CodexAnywhereBridgeDeps {
   telegram?: TelegramClient;
   codex?: CodexClient;
   initialState?: StoredState;
+  botId?: string;
+  botLabel?: string;
+  persistConfig?: (config: BotRuntimeConfig) => Promise<void>;
+  sessionOwnership?: SessionOwnershipRegistry;
+  addBot?: (bot: BotRuntimeConfig) => Promise<void>;
 }
 
 export class CodexAnywhereBridge {
   readonly #configPath: string;
   readonly #statePath: string;
-  readonly #config: StoredConfig;
+  readonly #botId: string;
+  readonly #botLabel: string;
+  readonly #config: BotRuntimeConfig;
   readonly #telegram: TelegramClient;
   readonly #codex: CodexClient;
+  readonly #persistConfigFn: (config: BotRuntimeConfig) => Promise<void>;
+  readonly #sessionOwnership: SessionOwnershipRegistry | null;
+  readonly #addBotFn: ((bot: BotRuntimeConfig) => Promise<void>) | null;
   readonly #pendingApprovals = new Map<string, PendingApproval>();
   readonly #pendingShellCommands = new Map<string, { chatId: number; command: string }>();
   readonly #pendingSessionSwitches = new Map<string, { chatId: number; threadId: string; targetWorkspace: string }>();
@@ -120,6 +132,7 @@ export class CodexAnywhereBridge {
   readonly #items = new Map<string, JsonObject>();
   readonly #streams = new Map<string, StreamBuffer>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
+  readonly #hasInitialState: boolean;
   #initialized = false;
   #state: StoredState = {
     version: 1,
@@ -128,7 +141,7 @@ export class CodexAnywhereBridge {
   };
 
   constructor(
-    config: StoredConfig,
+    config: BotRuntimeConfig,
     configPath: string,
     statePath: string,
     deps?: CodexAnywhereBridgeDeps,
@@ -136,20 +149,40 @@ export class CodexAnywhereBridge {
     this.#config = config;
     this.#configPath = configPath;
     this.#statePath = statePath;
+    this.#botId = deps?.botId ?? config.id;
+    this.#botLabel = deps?.botLabel ?? config.label;
     this.#telegram = deps?.telegram ?? new TelegramBotApi(config.telegramBotToken);
     this.#codex = deps?.codex ?? new CodexAppServerClient(["codex", "app-server"]);
+    this.#persistConfigFn = deps?.persistConfig ?? (async (nextConfig) => {
+      await saveConfig(this.#configPath, {
+        version: 1,
+        telegramBotToken: nextConfig.telegramBotToken,
+        workspaceCwd: nextConfig.workspaceCwd,
+        ownerUserId: nextConfig.ownerUserId,
+        pollTimeoutSeconds: nextConfig.pollTimeoutSeconds,
+        streamEditIntervalMs: nextConfig.streamEditIntervalMs,
+      });
+    });
+    this.#sessionOwnership = deps?.sessionOwnership ?? null;
+    this.#addBotFn = deps?.addBot ?? null;
+    this.#hasInitialState = Boolean(deps?.initialState);
     if (deps?.initialState) {
       this.#state = deps.initialState;
     }
   }
 
-  async initialize(options?: { printStartupHelp?: boolean }): Promise<void> {
+  async initialize(options?: { printStartupHelp?: boolean; reconcilePersistedState?: boolean }): Promise<void> {
     if (this.#initialized) {
       return;
     }
-    this.#state = await loadState(this.#statePath);
+    if (!this.#hasInitialState) {
+      this.#state = await loadState(this.#statePath);
+    }
     await this.#codex.start();
     await this.#codex.initialize();
+    if (options?.reconcilePersistedState ?? false) {
+      await this.#reconcilePersistedThreads();
+    }
     await this.#registerTelegramCommands();
     if (options?.printStartupHelp ?? true) {
       this.#printStartupHelp();
@@ -303,6 +336,9 @@ export class CodexAnywhereBridge {
           return;
         case "workspace":
           await this.#handleWorkspaceCommand(message.chat.id, slashCommand.args);
+          return;
+        case "addbot":
+          await this.#handleAddBotCommand(message.chat.id);
           return;
         default:
           if (isRecognizedCodexSlashCommand(slashCommand.name)) {
@@ -631,7 +667,7 @@ export class CodexAnywhereBridge {
     }
 
     this.#config.workspaceCwd = targetPath;
-    await saveConfig(this.#configPath, this.#config);
+    await this.#persistConfig();
 
     this.#clearAllChatBindings();
     await this.#saveState();
@@ -738,7 +774,13 @@ export class CodexAnywhereBridge {
       return false;
     }
 
-    if (text.startsWith("/") && step.kind !== "url") {
+    const allowLeadingSlashText =
+      step.kind === "text"
+      && session.kind === "local"
+      && step.key === "workspaceCwd"
+      && asString(session.meta?.command) === "addbot";
+
+    if (text.startsWith("/") && step.kind !== "url" && !allowLeadingSlashText) {
       await this.#sendText(chatId, "Reply with your answer for the active prompt, or send /cancel.");
       return true;
     }
@@ -1030,6 +1072,9 @@ export class CodexAnywhereBridge {
       case "review":
         await this.#applyLocalReviewSelection(session.chatId, session.answers);
         return;
+      case "addbot":
+        await this.#applyLocalAddBotSelection(session.chatId, session.answers);
+        return;
       default:
         await this.#sendText(session.chatId, "Unsupported local interactive command.");
     }
@@ -1058,6 +1103,7 @@ export class CodexAnywhereBridge {
     if (!threadId) {
       throw new Error("Codex did not return a forked thread id.");
     }
+    this.#replaceThreadOwnership(state.threadId, threadId);
     state.threadId = threadId;
     state.freshThread = true;
     state.activeTurnId = null;
@@ -1085,6 +1131,17 @@ export class CodexAnywhereBridge {
         "Inspect the codebase first, then write concise project-specific instructions for Codex.",
         "Include build/test/lint commands, important conventions, and workflow guidance.",
       ].join(" "),
+    );
+  }
+
+  async #handleAddBotCommand(chatId: number): Promise<void> {
+    if (!this.#addBotFn) {
+      await this.#sendText(chatId, "Adding bots from Telegram is not available in this runtime.");
+      return;
+    }
+    await this.#startLocalSlashInteractiveSession(
+      chatId,
+      buildAddBotInteractiveSession(this.#config),
     );
   }
 
@@ -1799,7 +1856,16 @@ export class CodexAnywhereBridge {
         await this.#sendText(chatId, "Cancelled workspace switch.");
         return;
       }
-      await this.#completeSessionTakeover(chatId, pending.threadId, pending.targetWorkspace);
+      try {
+        await this.#completeSessionTakeover(chatId, pending.threadId, pending.targetWorkspace);
+      } catch (error) {
+        if (error instanceof SessionOwnershipConflictError) {
+          await this.#telegram.answerCallbackQuery(callbackQueryId, "Session locked");
+          await this.#sendText(chatId, this.#formatSessionOwnershipConflict(error.threadId, error.ownerBotId));
+          return;
+        }
+        throw error;
+      }
       await this.#telegram.answerCallbackQuery(callbackQueryId, "Workspace switched");
       await this.#sendHtmlText(chatId, await this.#formatTakeoverMessage(pending.threadId, pending.targetWorkspace));
       return;
@@ -1859,7 +1925,15 @@ export class CodexAnywhereBridge {
     }
     const targetWorkspace = asString(thread.cwd);
     if (!targetWorkspace || targetWorkspace === this.#config.workspaceCwd) {
-      await this.#takeOverSession(chatId, threadId);
+      try {
+        await this.#takeOverSession(chatId, threadId);
+      } catch (error) {
+        if (error instanceof SessionOwnershipConflictError) {
+          await this.#sendText(chatId, this.#formatSessionOwnershipConflict(error.threadId, error.ownerBotId));
+          return;
+        }
+        throw error;
+      }
       await this.#sendHtmlText(chatId, await this.#formatTakeoverMessage(threadId));
       return;
     }
@@ -1895,7 +1969,8 @@ export class CodexAnywhereBridge {
   async #takeOverSession(chatId: number, threadId: string): Promise<void> {
     const previousState = structuredClone(this.#chatState(chatId));
     const state = this.#chatState(chatId);
-    this.#resetChatSessionState(state);
+    this.#claimThreadOwnership(threadId);
+    this.#resetChatSessionState(state, { releaseOwnership: false });
     state.threadId = threadId;
     try {
       await this.#codex.call("thread/resume", {
@@ -1904,21 +1979,24 @@ export class CodexAnywhereBridge {
       });
     } catch (error) {
       if (!isMissingRolloutResumeError(error)) {
+        this.#releaseThreadOwnership(threadId);
         this.#state.chats[String(chatId)] = previousState;
         await this.#saveState();
         throw error;
       }
     }
+    this.#releaseThreadOwnership(previousState.threadId);
     await this.#saveState();
   }
 
   async #completeSessionTakeover(chatId: number, threadId: string, targetWorkspace: string): Promise<void> {
     const previousWorkspace = this.#config.workspaceCwd;
     const previousState = structuredClone(this.#state);
+    this.#claimThreadOwnership(threadId);
     this.#config.workspaceCwd = targetWorkspace;
-    this.#clearAllChatBindings();
+    this.#clearAllChatBindings({ releaseOwnership: false });
     const state = this.#chatState(chatId);
-    this.#resetChatSessionState(state);
+    this.#resetChatSessionState(state, { releaseOwnership: false });
     state.threadId = threadId;
     try {
       await this.#codex.call("thread/resume", {
@@ -1927,12 +2005,16 @@ export class CodexAnywhereBridge {
       });
     } catch (error) {
       if (!isMissingRolloutResumeError(error)) {
+        this.#releaseThreadOwnership(threadId);
         this.#config.workspaceCwd = previousWorkspace;
         this.#state = previousState;
         throw error;
       }
     }
-    await saveConfig(this.#configPath, this.#config);
+    for (const chatState of Object.values(previousState.chats)) {
+      this.#releaseThreadOwnership(chatState.threadId);
+    }
+    await this.#persistConfig();
     await this.#saveState();
   }
 
@@ -2258,7 +2340,7 @@ export class CodexAnywhereBridge {
       return;
     }
     this.#config.ownerUserId = userId;
-    await saveConfig(this.#configPath, this.#config);
+    await this.#persistConfig();
     await this.#sendText(
       chatId,
       [
@@ -2280,6 +2362,7 @@ export class CodexAnywhereBridge {
       throw new Error("Codex did not return a thread id.");
     }
     const state = this.#chatState(chatId);
+    this.#replaceThreadOwnership(state.threadId, threadId);
     state.threadId = threadId;
     state.freshThread = true;
     state.activeTurnId = null;
@@ -2295,23 +2378,33 @@ export class CodexAnywhereBridge {
     if (!state.threadId) {
       return await this.#startNewThread(chatId, silent);
     }
-    if (state.freshThread) {
-      return state.threadId;
-    }
+
+    const existingThreadId = state.threadId;
     try {
       await this.#codex.call("thread/resume", {
-        threadId: state.threadId,
+        threadId: existingThreadId,
         ...threadSessionOverrides(this.#config, state),
       });
+      state.freshThread = false;
+      await this.#saveState();
+      if (!silent) {
+        await this.#sendText(chatId, "Thread resumed.");
+      }
+      return existingThreadId;
     } catch (error) {
       if (!isMissingRolloutResumeError(error)) {
         throw error;
       }
     }
-    if (!silent) {
-      await this.#sendText(chatId, "Thread resumed.");
-    }
-    return state.threadId;
+
+    this.#releaseThreadOwnership(existingThreadId);
+    state.threadId = null;
+    state.freshThread = false;
+    state.activeTurnId = null;
+    state.turnControlTurnId = null;
+    state.turnControlMessageId = null;
+    await this.#saveState();
+    return await this.#startNewThread(chatId, silent);
   }
 
   async #interruptTurn(chatId: number): Promise<void> {
@@ -2367,20 +2460,44 @@ export class CodexAnywhereBridge {
     input: JsonObject[],
     extraParams?: JsonObject,
   ): Promise<void> {
-    const threadId = await this.#resumeThread(chatId, true);
-    const params = {
+    let threadId = await this.#resumeThread(chatId, true);
+    const state = this.#chatState(chatId);
+    let params = {
       threadId,
       input,
-      ...turnSessionOverrides(this.#config, this.#chatState(chatId)),
+      ...turnSessionOverrides(this.#config, state),
       ...(extraParams ?? {}),
     } satisfies JsonObject;
-    const result = await this.#codex.call("turn/start", params);
+
+    let result: JsonObject;
+    try {
+      result = await this.#codex.call("turn/start", params);
+    } catch (error) {
+      if (!isMissingRolloutResumeError(error)) {
+        throw error;
+      }
+      this.#releaseThreadOwnership(threadId);
+      state.threadId = null;
+      state.freshThread = false;
+      state.activeTurnId = null;
+      state.turnControlTurnId = null;
+      state.turnControlMessageId = null;
+      await this.#saveState();
+      threadId = await this.#startNewThread(chatId, true);
+      params = {
+        threadId,
+        input,
+        ...turnSessionOverrides(this.#config, this.#chatState(chatId)),
+        ...(extraParams ?? {}),
+      } satisfies JsonObject;
+      result = await this.#codex.call("turn/start", params);
+    }
+
     const turn = result.turn as JsonObject | undefined;
     const turnId = asString(turn?.id);
     if (!turnId) {
       throw new Error("Codex did not return a turn id.");
     }
-    const state = this.#chatState(chatId);
     state.activeTurnId = turnId;
     state.freshThread = false;
     await this.#saveState();
@@ -2778,6 +2895,15 @@ export class CodexAnywhereBridge {
       return;
     }
     const state = this.#chatState(chatId);
+    try {
+      this.#replaceThreadOwnership(state.threadId, threadId);
+    } catch (error) {
+      if (error instanceof SessionOwnershipConflictError) {
+        await this.#sendText(chatId, this.#formatSessionOwnershipConflict(error.threadId, error.ownerBotId));
+        return;
+      }
+      throw error;
+    }
     state.threadId = threadId;
     state.freshThread = false;
     state.activeTurnId = null;
@@ -2825,6 +2951,63 @@ export class CodexAnywhereBridge {
     await this.#sendText(
       chatId,
       `Detailed tool/file messages ${state.verbose ? "enabled" : "disabled"}.`,
+    );
+  }
+
+  async #applyLocalAddBotSelection(
+    chatId: number,
+    answers: Record<string, unknown>,
+  ): Promise<void> {
+    if (!this.#addBotFn) {
+      await this.#sendText(chatId, "Adding bots from Telegram is not available in this runtime.");
+      return;
+    }
+    const rawBotId = asString(answers.botId)?.trim();
+    const telegramBotToken = asString(answers.telegramBotToken)?.trim();
+    const workspaceInput = asString(answers.workspaceCwd)?.trim();
+    const labelInput = asString(answers.label)?.trim() ?? "";
+    if (!rawBotId || !telegramBotToken || !workspaceInput) {
+      await this.#sendText(chatId, "Add-bot details were incomplete.");
+      return;
+    }
+
+    const workspaceCwd = resolveWorkspacePath(
+      workspaceInput,
+      this.#config.workspaceCwd,
+      os.homedir(),
+    );
+    try {
+      await fs.access(workspaceCwd);
+    } catch {
+      await this.#sendText(chatId, `Workspace path does not exist: ${workspaceCwd}`);
+      return;
+    }
+
+    const bot: BotRuntimeConfig = {
+      id: rawBotId,
+      label: labelInput === "-" ? rawBotId : (labelInput || rawBotId),
+      telegramBotToken,
+      workspaceCwd,
+      ownerUserId: this.#config.ownerUserId,
+      pollTimeoutSeconds: this.#config.pollTimeoutSeconds,
+      streamEditIntervalMs: this.#config.streamEditIntervalMs,
+    };
+
+    try {
+      await this.#addBotFn(bot);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      await this.#sendText(chatId, `Failed to add bot: ${message}`);
+      return;
+    }
+
+    await this.#sendText(
+      chatId,
+      [
+        `Added bot ${bot.id}.`,
+        `Workspace: ${bot.workspaceCwd}`,
+        "The new Telegram bot is now configured and started in this runtime.",
+      ].join("\n"),
     );
   }
 
@@ -2902,24 +3085,26 @@ export class CodexAnywhereBridge {
         threadId,
         includeTurns: true,
       });
-      return reconcileActiveTurnIdFromThreadRead(
-        response.thread as JsonObject | undefined,
-        state.activeTurnId,
-      );
+      const thread = response.thread as JsonObject | undefined;
+      if ((thread?.status as JsonObject | undefined)?.type === "notLoaded") {
+        return null;
+      }
+      return reconcileActiveTurnIdFromThreadRead(thread, state.activeTurnId);
     } catch (includeTurnsError) {
       try {
         const response = await this.#codex.call("thread/read", {
           threadId,
           includeTurns: false,
         });
-        return reconcileActiveTurnIdFromThreadRead(
-          response.thread as JsonObject | undefined,
-          state.activeTurnId,
-        );
+        const thread = response.thread as JsonObject | undefined;
+        if ((thread?.status as JsonObject | undefined)?.type === "notLoaded") {
+          return null;
+        }
+        return reconcileActiveTurnIdFromThreadRead(thread, state.activeTurnId);
       } catch (statusOnlyError) {
         this.#logRuntimeError("thread/read", includeTurnsError);
         this.#logRuntimeError("thread/read fallback", statusOnlyError);
-        return state.activeTurnId;
+        return null;
       }
     }
   }
@@ -3003,13 +3188,20 @@ export class CodexAnywhereBridge {
     return this.#state.chats[key];
   }
 
-  #clearAllChatBindings(): void {
+  #clearAllChatBindings(options: { releaseOwnership?: boolean } = {}): void {
     for (const state of Object.values(this.#state.chats)) {
-      this.#resetChatSessionState(state);
+      this.#resetChatSessionState(state, options);
     }
   }
 
-  #resetChatSessionState(state: ChatSessionState): void {
+  #resetChatSessionState(
+    state: ChatSessionState,
+    options: { releaseOwnership?: boolean } = {},
+  ): void {
+    const threadId = options.releaseOwnership ?? true ? state.threadId : null;
+    if (threadId) {
+      this.#sessionOwnership?.release(this.#botId, threadId);
+    }
     state.threadId = null;
     state.freshThread = false;
     state.activeTurnId = null;
@@ -3036,7 +3228,7 @@ export class CodexAnywhereBridge {
   }
 
   #printStartupHelp(): void {
-    console.log(`Codex Anywhere running for workspace: ${this.#config.workspaceCwd}`);
+    console.log(`Codex Anywhere bot ${this.#botLabel} running for workspace: ${this.#config.workspaceCwd}`);
     if (this.#config.ownerUserId === null) {
       console.log("Pairing mode: open your bot in Telegram and send /start from your account.");
       return;
@@ -3046,7 +3238,107 @@ export class CodexAnywhereBridge {
 
   #logRuntimeError(source: string, error: unknown): void {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[codex-anywhere] ${source} error: ${message}`);
+    console.error(`[codex-anywhere:${this.#botId}] ${source} error: ${message}`);
+  }
+
+  async #persistConfig(): Promise<void> {
+    await this.#persistConfigFn(this.#config);
+  }
+
+  #replaceThreadOwnership(previousThreadId: string | null, nextThreadId: string | null): void {
+    if (nextThreadId && nextThreadId !== previousThreadId) {
+      this.#claimThreadOwnership(nextThreadId);
+    }
+    if (previousThreadId && previousThreadId !== nextThreadId) {
+      this.#releaseThreadOwnership(previousThreadId);
+    }
+  }
+
+  #claimThreadOwnership(threadId: string | null): void {
+    if (!threadId) {
+      return;
+    }
+    const result = this.#sessionOwnership?.claim(this.#botId, threadId);
+    if (result && !result.ok) {
+      throw new SessionOwnershipConflictError(threadId, result.ownerBotId);
+    }
+  }
+
+  #releaseThreadOwnership(threadId: string | null): void {
+    if (!threadId) {
+      return;
+    }
+    this.#sessionOwnership?.release(this.#botId, threadId);
+  }
+
+  #formatSessionOwnershipConflict(threadId: string, ownerBotId: string): string {
+    return [
+      `Session ${threadId} is already owned by Telegram bot ${ownerBotId}.`,
+      "Finish or release it there before taking it over here.",
+    ].join("\n");
+  }
+
+  async #reconcilePersistedThreads(): Promise<void> {
+    let changed = false;
+    for (const [chatId, state] of Object.entries(this.#state.chats)) {
+      const threadId = state.threadId;
+      if (!threadId) {
+        continue;
+      }
+
+      let thread: JsonObject | undefined;
+      try {
+        const response = await this.#codex.call("thread/read", {
+          threadId,
+          includeTurns: false,
+        });
+        thread = response.thread as JsonObject | undefined;
+      } catch {
+        thread = undefined;
+      }
+
+      const threadWorkspace = asString(thread?.cwd);
+      if (!thread || (threadWorkspace && threadWorkspace !== this.#config.workspaceCwd)) {
+        this.#resetChatSessionState(state, { releaseOwnership: false });
+        changed = true;
+        console.log(
+          `[codex-anywhere:${this.#botId}] dropped stale persisted thread ${threadId} for chat ${chatId}`,
+        );
+        continue;
+      }
+
+      this.#claimThreadOwnership(threadId);
+      const threadStatus = thread?.status as JsonObject | undefined;
+      const reconciledActiveTurnId = threadStatus?.type === "notLoaded"
+        ? null
+        : reconcileActiveTurnIdFromThreadRead(
+          thread,
+          state.activeTurnId,
+        );
+      if (state.activeTurnId !== reconciledActiveTurnId) {
+        state.activeTurnId = reconciledActiveTurnId;
+        changed = true;
+      }
+      if (state.freshThread) {
+        state.freshThread = false;
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      await this.#saveState();
+    }
+  }
+}
+
+class SessionOwnershipConflictError extends Error {
+  readonly threadId: string;
+  readonly ownerBotId: string;
+
+  constructor(threadId: string, ownerBotId: string) {
+    super(`Session ${threadId} is already owned by bot ${ownerBotId}.`);
+    this.threadId = threadId;
+    this.ownerBotId = ownerBotId;
   }
 }
 
@@ -3188,7 +3480,7 @@ function autoDeclineResult(method: string): JsonObject {
   return { decision: "cancel" };
 }
 
-function threadSessionOverrides(config: StoredConfig, state: ChatSessionState): JsonObject {
+function threadSessionOverrides(config: BotRuntimeConfig, state: ChatSessionState): JsonObject {
   const params: JsonObject = {
     cwd: config.workspaceCwd,
     approvalPolicy: state.approvalPolicy ?? "on-request",
@@ -3206,7 +3498,7 @@ function threadSessionOverrides(config: StoredConfig, state: ChatSessionState): 
   return params;
 }
 
-function turnSessionOverrides(config: StoredConfig, state: ChatSessionState): JsonObject {
+function turnSessionOverrides(config: BotRuntimeConfig, state: ChatSessionState): JsonObject {
   const params: JsonObject = {
     cwd: config.workspaceCwd,
     approvalPolicy: state.approvalPolicy ?? "on-request",
@@ -3495,6 +3787,7 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "cancel", description: "cancel the active interactive prompt" },
     { command: "sh", description: "run an explicit shell command" },
     { command: "workspace", description: "show or change the bot workspace" },
+    { command: "addbot", description: "add and start another Telegram bot" },
     { command: "omx", description: "run supported oh-my-codex CLI commands" },
     { command: "model", description: "show or set the active model" },
     { command: "personality", description: "set Codex personality" },

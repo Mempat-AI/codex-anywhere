@@ -7,8 +7,35 @@ export interface TelegramBotCommand {
   description: string;
 }
 
-export interface StoredConfig {
+export interface StoredSingleBotConfig {
   version: 1;
+  telegramBotToken: string;
+  workspaceCwd: string;
+  ownerUserId: number | null;
+  pollTimeoutSeconds: number;
+  streamEditIntervalMs: number;
+}
+
+export interface StoredBotDefinition {
+  id: string;
+  label?: string | null;
+  telegramBotToken: string;
+  workspaceCwd: string;
+  ownerUserId: number | null;
+  pollTimeoutSeconds: number;
+  streamEditIntervalMs: number;
+}
+
+export interface StoredMultiBotConfig {
+  version: 2;
+  bots: StoredBotDefinition[];
+}
+
+export type StoredConfig = StoredSingleBotConfig | StoredMultiBotConfig;
+
+export interface BotRuntimeConfig {
+  id: string;
+  label: string;
   telegramBotToken: string;
   workspaceCwd: string;
   ownerUserId: number | null;

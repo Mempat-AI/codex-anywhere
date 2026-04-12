@@ -34,6 +34,7 @@
   },
   "scripts": {
     "connect": "tsx src/cli.ts connect",
+    "add-bot": "tsx src/cli.ts add-bot",
     "start": "tsx src/cli.ts connect",
     "service:install": "tsx src/cli.ts install-service",
     "service:start": "tsx src/cli.ts start-service",
@@ -41,6 +42,7 @@
     "service:status": "tsx src/cli.ts service-status",
     "service:uninstall": "tsx src/cli.ts uninstall-service",
     "start:dist": "node dist/cli.js connect",
+    "add-bot:dist": "node dist/cli.js add-bot",
     "service:install:dist": "node dist/cli.js install-service",
     "service:start:dist": "node dist/cli.js start-service",
     "service:stop:dist": "node dist/cli.js stop-service",

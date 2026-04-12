@@ -11,6 +11,19 @@ export function getStoragePaths(env: NodeJS.ProcessEnv = process.env): StoragePa
   };
 }
 
+export function getBotStoragePaths(storagePaths: StoragePaths, botId: string): StoragePaths {
+  const root = path.dirname(storagePaths.configPath);
+  const botRoot = path.join(root, "bots", botId);
+  return {
+    configPath: path.join(botRoot, "config.json"),
+    statePath: path.join(botRoot, "state.json"),
+  };
+}
+
+export function getSessionOwnershipPath(storagePaths: StoragePaths): string {
+  return path.join(path.dirname(storagePaths.configPath), "session-ownership.json");
+}
+
 function resolveStorageRoot(env: NodeJS.ProcessEnv): string {
   return env.CODEX_ANYWHERE_HOME ?? defaultStorageRoot(env);
 }

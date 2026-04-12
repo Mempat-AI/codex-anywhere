@@ -132,7 +132,7 @@ export function normalizeReasoningEffort(value: string): string | null {
 export function codexSlashHelpText(): string {
   return [
     "Codex Anywhere commands:",
-    "/start, /help, /new, /resume, /continue, /interrupt, /cancel, /status, /sh <command>, /workspace <path>",
+    "/start, /help, /new, /resume, /continue, /interrupt, /cancel, /status, /sh <command>, /workspace <path>, /addbot",
     "Telegram will also show the registered command list when you type /",
     "",
     "Codex slash commands supported in Telegram:",

@@ -3,6 +3,8 @@
 import process from "node:process";
 
 import { bootstrapCodexAnywhere } from "./app.js";
+import { addBotToCodexAnywhereConfig } from "./configuration.js";
+import { runAddBotWizard } from "./onboarding.js";
 import { runBackgroundServiceCommand } from "./service.js";
 
 async function main(): Promise<void> {
@@ -15,13 +17,21 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "connect": {
-      const bridge = await bootstrapCodexAnywhere({
+      const runtime = await bootstrapCodexAnywhere({
         cwd: process.cwd(),
         env: process.env,
+        allowSetupWizard: !Boolean(process.env.XPC_SERVICE_NAME),
       });
-      await bridge.runLoops();
+      await runtime.runLoops();
       return;
     }
+    case "add-bot":
+      await addBotToCodexAnywhereConfig({
+        cwd: process.cwd(),
+        env: process.env,
+        runAddBotWizard,
+      });
+      return;
     case "install-service":
     case "start-service":
     case "stop-service":
@@ -41,15 +51,17 @@ function printHelp(): void {
   console.log(`Codex Anywhere
 
 Usage:
-  pnpm connect
-  pnpm service:install
-  pnpm service:start
-  pnpm service:stop
-  pnpm service:status
-  pnpm service:uninstall
+  codex-anywhere connect
+  codex-anywhere add-bot
+  codex-anywhere install-service
+  codex-anywhere start-service
+  codex-anywhere stop-service
+  codex-anywhere service-status
+  codex-anywhere uninstall-service
 
 Behavior:
   - connect runs guided setup on first launch and starts the Telegram bridge
+  - add-bot appends one bot definition to the shared config after connect has migrated older installs
   - macOS service commands manage a LaunchAgent background service
   - Linux service commands manage a user-level systemd background service
   - config/state live under CODEX_ANYWHERE_HOME or your user config directory
