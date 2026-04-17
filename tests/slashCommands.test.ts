@@ -41,3 +41,8 @@ test("normalizeReasoningEffort only accepts supported values", () => {
 test("codexSlashHelpText mentions /omx bridge support", () => {
   assert.match(codexSlashHelpText(), /\/omx \[args]/);
 });
+
+test("codexSlashHelpText mentions /computer plugin support", () => {
+  assert.match(codexSlashHelpText(), /\/computer <task>/);
+  assert.match(codexSlashHelpText(), /Computer Use must be enabled from the Codex app/);
+});

@@ -132,7 +132,7 @@ export function normalizeReasoningEffort(value: string): string | null {
 export function codexSlashHelpText(): string {
   return [
     "Codex Anywhere commands:",
-    "/start, /help, /new, /resume, /continue, /interrupt, /cancel, /status, /sh <command>, /workspace <path>, /addbot",
+    "/start, /help, /new, /resume, /continue, /interrupt, /cancel, /status, /sh <command>, /workspace <path>, /addbot, /omx <args>, /computer <task>",
     "Telegram will also show the registered command list when you type /",
     "",
     "Codex slash commands supported in Telegram:",
@@ -151,6 +151,8 @@ export function codexSlashHelpText(): string {
     "/experimental [status|<feature> on|off], /rollout, /logout, /quit, /exit, /stop",
     "/esc (/ese alias) to interrupt the current turn",
     "/omx [args] to run supported oh-my-codex CLI commands",
+    "/computer <task> to run a Computer Use task through the bundled plugin",
+    "Note: Computer Use must be enabled from the Codex app before /computer can control the desktop.",
     "",
     "Interactive prompts:",
     "- approvals and file changes appear as Telegram buttons",

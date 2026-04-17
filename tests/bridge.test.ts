@@ -9,6 +9,7 @@ import { loadConfig, loadState, saveConfig, saveState } from "../src/persistence
 import { InMemorySessionOwnershipRegistry } from "../src/sessionOwnership.js";
 import type {
   BotRuntimeConfig,
+  ChatSessionState,
   JsonObject,
   StoredConfig,
   StoredState,
@@ -116,6 +117,41 @@ function testState(): StoredState {
     lastUpdateId: null,
     chats: {},
   };
+}
+
+function testChatState(overrides: Partial<ChatSessionState> = {}): ChatSessionState {
+  return {
+    threadId: null,
+    freshThread: false,
+    activeTurnId: null,
+    turnControlTurnId: null,
+    turnControlMessageId: null,
+    verbose: false,
+    queueNextArmed: false,
+    queuedTurnInput: null,
+    pendingTurnInput: null,
+    pendingMention: null,
+    model: null,
+    reasoningEffort: null,
+    personality: null,
+    collaborationModeName: null,
+    collaborationMode: null,
+    serviceTier: null,
+    approvalPolicy: null,
+    lastAssistantMessage: null,
+    ...overrides,
+  };
+}
+
+function computerUseInput(task: string): JsonObject[] {
+  return [
+    { type: "text", text: `@computer-use ${task}` },
+    {
+      type: "mention",
+      name: "Computer Use",
+      path: "plugin://computer-use@openai-bundled",
+    },
+  ];
 }
 
 function telegramMessageUpdate(text: string): TelegramUpdate {
@@ -231,6 +267,78 @@ test("bridge maps skill-first OMX workflows back into the current thread", async
   assert.deepEqual(codex.calls[1]!.params?.input, [
     { type: "text", text: "$deep-interview clarify requirements" },
   ]);
+});
+
+test("bridge routes /computer through the Computer Use plugin mention", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/computer play a music"));
+
+  assert.equal(telegram.sentMessages.length, 0);
+  assert.equal(codex.calls.length, 2);
+  assert.equal(codex.calls[0]!.method, "thread/start");
+  assert.equal(codex.calls[1]!.method, "turn/start");
+  assert.deepEqual(codex.calls[1]!.params?.input, computerUseInput("play a music"));
+});
+
+test("bridge queues /computer input through the normal active-turn path", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/read") {
+      return {
+        thread: {
+          id: "thread-1",
+          status: { type: "active" },
+          turns: [{ id: "turn-1", status: "inProgress" }],
+        },
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const state = testState();
+  state.chats["42"] = testChatState({
+    threadId: "thread-1",
+    activeTurnId: "turn-1",
+    turnControlTurnId: "turn-1",
+    turnControlMessageId: 99,
+    queueNextArmed: true,
+  });
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/computer play a music"));
+
+  assert.deepEqual(codex.calls.map((call) => call.method), ["thread/read"]);
+  assert.equal(state.chats["42"]!.queueNextArmed, false);
+  assert.deepEqual(state.chats["42"]!.queuedTurnInput, computerUseInput("play a music"));
+  assert.match(telegram.sentMessages[0]!.text, /Queued/);
+});
+
+test("bridge shows /computer usage when task is missing", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/computer"));
+
+  assert.equal(codex.calls.length, 0);
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.text, "Usage: /computer <task>");
 });
 
 runOmxCommandTest("bridge routes $team through the OMX team CLI path", serialTest, async () => {

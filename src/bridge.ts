@@ -82,6 +82,9 @@ import type {
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
+const COMPUTER_USE_PLUGIN_NAME = "Computer Use";
+const COMPUTER_USE_PLUGIN_PATH = "plugin://computer-use@openai-bundled";
+const COMPUTER_USE_MENTION_TOKEN = "@computer-use";
 
 type TelegramClient = Pick<
   TelegramBotApi,
@@ -333,6 +336,9 @@ export class CodexAnywhereBridge {
           return;
         case "omx":
           await this.#handleOmxCommand(message.chat.id, slashCommand.args);
+          return;
+        case "computer":
+          await this.#handleComputerCommand(message.chat.id, slashCommand.args);
           return;
         case "workspace":
           await this.#handleWorkspaceCommand(message.chat.id, slashCommand.args);
@@ -626,6 +632,19 @@ export class CodexAnywhereBridge {
     }
 
     await this.#runOmxCommand(chatId, plan.argv);
+  }
+
+  async #handleComputerCommand(chatId: number, args: string): Promise<void> {
+    const task = args.trim();
+    if (!task) {
+      await this.#sendText(chatId, "Usage: /computer <task>");
+      return;
+    }
+
+    await this.#submitChatInput(chatId, [
+      { type: "text", text: `${COMPUTER_USE_MENTION_TOKEN} ${task}` },
+      { type: "mention", name: COMPUTER_USE_PLUGIN_NAME, path: COMPUTER_USE_PLUGIN_PATH },
+    ]);
   }
 
   async #handleWorkspaceCommand(chatId: number, args: string): Promise<void> {
@@ -3789,6 +3808,7 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "workspace", description: "show or change the bot workspace" },
     { command: "addbot", description: "add and start another Telegram bot" },
     { command: "omx", description: "run supported oh-my-codex CLI commands" },
+    { command: "computer", description: "run a Computer Use task" },
     { command: "model", description: "show or set the active model" },
     { command: "personality", description: "set Codex personality" },
     { command: "fast", description: "toggle Fast mode" },

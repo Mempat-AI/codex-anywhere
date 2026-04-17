@@ -109,6 +109,10 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 - run `$deep-interview`, `$autopilot`, and other OMX skills directly in the chat
 - use `/omx status`, `/omx doctor`, and other CLI commands via `/omx <args>`
 
+**Use Computer Use:**
+- send `/computer <task>` to route a task through the bundled Computer Use plugin
+- Computer Use must be enabled from the Codex app before `/computer` can control the desktop
+
 **Add another bot from Telegram:**
 - send `/addbot` from the currently paired admin bot
 - reply with bot id, label, BotFather token, and workspace path
@@ -136,11 +140,12 @@ Telegram-native:
 | `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
 | `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
 | `/omx [args]` | Run [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) CLI commands from Telegram |
+| `/computer <task>` | Run a task through the bundled Computer Use plugin |
 | `/esc` `/ese` | Interrupt aliases |
 
 Codex commands supported through the bridge:
 
-`/start` `/help` `/new` `/resume` `/continue` `/interrupt` `/cancel` `/status` `/sh` `/workspace` `/addbot` `/model` `/fast` `/personality` `/permissions` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
+`/start` `/help` `/new` `/resume` `/continue` `/interrupt` `/cancel` `/status` `/sh` `/workspace` `/addbot` `/omx` `/computer` `/model` `/fast` `/personality` `/permissions` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
 
 ## Development
 
