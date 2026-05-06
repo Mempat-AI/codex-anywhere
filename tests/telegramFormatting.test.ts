@@ -8,6 +8,7 @@ import {
   formatCommandCompletionHtml,
   formatFileChangeCompletionHtml,
   formatPendingInputActionHtml,
+  formatThreadGoalHtml,
   formatTurnCompletionHtml,
   formatTurnControlPromptHtml,
   renderAssistantTextHtml,
@@ -101,6 +102,29 @@ test("formatApprovalResolutionHtml shows final state without losing prompt conte
   assert.match(html, /<b>Approved command<\/b>/);
   assert.match(html, /<code>cat &lt;secret&gt;<\/code>/);
   assert.doesNotMatch(html, /Approve command\?/);
+});
+
+test("formatThreadGoalHtml renders no-goal state", () => {
+  const html = formatThreadGoalHtml(null);
+  assert.match(html, /<b>Goal<\/b>/);
+  assert.match(html, /No goal is currently set/);
+  assert.match(html, /\/goal set &lt;objective&gt;/);
+});
+
+test("formatThreadGoalHtml renders goal details", () => {
+  const html = formatThreadGoalHtml({
+    objective: "Ship Telegram goal support <soon>",
+    status: "active",
+    tokenBudget: 50000,
+    tokensUsed: 1234,
+    timeUsedSeconds: 42,
+  });
+  assert.match(html, /<b>Objective<\/b>/);
+  assert.match(html, /Ship Telegram goal support &lt;soon&gt;/);
+  assert.match(html, /<b>Status<\/b>\nactive/);
+  assert.match(html, /<b>Budget<\/b>\n<code>50000<\/code>/);
+  assert.match(html, /<b>Used<\/b>\n<code>1234<\/code>/);
+  assert.match(html, /<b>Time used<\/b>\n<code>42s<\/code>/);
 });
 
 test("formatTurnCompletionHtml returns null on success", () => {

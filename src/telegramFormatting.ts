@@ -52,6 +52,46 @@ export function formatApprovalResolutionHtml(
   ].join("\n");
 }
 
+export function formatThreadGoalHtml(goal: JsonObject | null): string {
+  if (!goal) {
+    return [
+      "<b>Goal</b>",
+      "",
+      "No goal is currently set for this thread.",
+      "Use <code>/goal set &lt;objective&gt;</code>.",
+    ].join("\n");
+  }
+
+  const lines = [
+    "<b>Goal</b>",
+    "",
+    "<b>Objective</b>",
+    `<code>${escapeTelegramHtml(asString(goal.objective) ?? "unknown")}</code>`,
+  ];
+
+  const status = asString(goal.status);
+  if (status) {
+    lines.push("", "<b>Status</b>", escapeTelegramHtml(status));
+  }
+
+  const tokenBudget = formatGoalNumber(goal.tokenBudget);
+  if (tokenBudget) {
+    lines.push("", "<b>Budget</b>", `<code>${escapeTelegramHtml(tokenBudget)}</code>`);
+  }
+
+  const tokensUsed = formatGoalNumber(goal.tokensUsed);
+  if (tokensUsed) {
+    lines.push("", "<b>Used</b>", `<code>${escapeTelegramHtml(tokensUsed)}</code>`);
+  }
+
+  const timeUsed = formatGoalNumber(goal.timeUsedSeconds);
+  if (timeUsed) {
+    lines.push("", "<b>Time used</b>", `<code>${escapeTelegramHtml(timeUsed)}s</code>`);
+  }
+
+  return lines.join("\n");
+}
+
 export function formatCommandCompletionHtml(item: JsonObject, verbose = false): string {
   const command = asString(item.command) ?? "<unknown>";
   const status = asString(item.status) ?? "unknown";
@@ -261,6 +301,16 @@ function approvalResolutionTitle(
     case "decline": return `Declined ${noun}`;
     case "cancel": return `Cancelled ${noun}`;
   }
+}
+
+function formatGoalNumber(value: unknown): string | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "string" && value.trim()) {
+    return value.trim();
+  }
+  return null;
 }
 
 function collectChangePaths(item: JsonObject | undefined): string[] {

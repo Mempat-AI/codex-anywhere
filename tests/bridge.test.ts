@@ -826,6 +826,161 @@ test("/reload explains unavailable local thread state", async () => {
   assert.match(telegram.sentMessages[0]!.text, /\/resume or \/continue/);
 });
 
+test("/goal requires an existing current thread", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/goal"));
+
+  assert.equal(codex.calls.length, 0);
+  assert.match(telegram.sentMessages[0]!.text, /No current thread/);
+});
+
+test("/goal reads and renders the current thread goal", async () => {
+  const state = testState();
+  state.chats["42"] = testChatState({ threadId: "thread-1" });
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/goal/get") {
+      return {
+        goal: {
+          threadId: "thread-1",
+          objective: "Keep Telegram continuity stable",
+          status: "active",
+          tokenBudget: 50000,
+          tokensUsed: 123,
+          timeUsedSeconds: 9,
+        },
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/goal"));
+
+  assert.deepEqual(codex.calls.map((call) => call.method), ["thread/goal/get"]);
+  assert.match(telegram.sentMessages[0]!.text, /Keep Telegram continuity stable/);
+  assert.match(telegram.sentMessages[0]!.text, /<b>Status<\/b>\nactive/);
+});
+
+test("/goal status aliases goal get", async () => {
+  const state = testState();
+  state.chats["42"] = testChatState({ threadId: "thread-1" });
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/goal/get") {
+      return { goal: null };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/goal status"));
+
+  assert.deepEqual(codex.calls.map((call) => call.method), ["thread/goal/get"]);
+  assert.match(telegram.sentMessages[0]!.text, /No goal is currently set/);
+});
+
+test("/goal set creates or updates the current thread goal", async () => {
+  const state = testState();
+  state.chats["42"] = testChatState({ threadId: "thread-1" });
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/goal/set") {
+      return {
+        goal: {
+          threadId: "thread-1",
+          objective: params?.objective,
+          status: "active",
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeUsedSeconds: 0,
+        },
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/goal set Investigate reload continuity"));
+
+  assert.deepEqual(codex.calls.map((call) => call.method), ["thread/goal/set"]);
+  assert.equal(codex.calls[0]!.params?.threadId, "thread-1");
+  assert.equal(codex.calls[0]!.params?.objective, "Investigate reload continuity");
+  assert.match(telegram.sentMessages[0]!.text, /Investigate reload continuity/);
+});
+
+test("/goal clear clears the current thread goal", async () => {
+  const state = testState();
+  state.chats["42"] = testChatState({ threadId: "thread-1" });
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/goal/clear") {
+      return { cleared: true };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/goal clear"));
+
+  assert.deepEqual(codex.calls.map((call) => call.method), ["thread/goal/clear"]);
+  assert.match(telegram.sentMessages[0]!.text, /Goal cleared\./);
+});
+
+test("/goal reports feature-unavailable failures cleanly", async () => {
+  const state = testState();
+  state.chats["42"] = testChatState({ threadId: "thread-1" });
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/goal/get") {
+      throw new Error('{\"code\":-32601,\"message\":\"unknown method thread/goal/get\"}');
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/goal"));
+
+  assert.match(telegram.sentMessages[0]!.text, /Goals are not enabled or not supported/);
+});
+
 test("/version reports the installed package version", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();

@@ -104,6 +104,12 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 - send `/reload` to pull the latest context for the currently bound session
 - `/reload` never browses, switches, or selects another session
 
+**Manage thread goals:**
+- send `/goal` or `/goal status` to inspect the current thread goal
+- send `/goal set <objective>` to create or replace the current thread goal
+- send `/goal clear` to remove the current thread goal
+- goals require the local Codex installation to have the experimental `goals` feature enabled
+
 **Upgrade Codex Anywhere from Telegram:**
 - send `/upgrade` to run `npm install -g codex-anywhere@latest`
 - after a successful install, Codex Anywhere restarts its background service
@@ -155,6 +161,7 @@ Telegram-native:
 | `/resume` | Browse and continue sessions in the current workspace |
 | `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
 | `/reload` | Pull the latest context for the current session |
+| `/goal [status\|set <objective>\|clear]` | Show or manage the current thread goal |
 | `/upgrade` | Upgrade the global `codex-anywhere` package to latest and restart the service |
 | `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
 | `/omx [args]` | Run [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) CLI commands from Telegram |
@@ -165,7 +172,7 @@ Supported Telegram command surface:
 
 This includes Telegram-native bridge commands plus Codex slash commands forwarded or adapted by Codex Anywhere.
 
-`/start` `/help` `/new` `/resume` `/continue` `/reload` `/upgrade` `/interrupt` `/cancel` `/status` `/workspace` `/addbot` `/omx` `/computer` `/model` `/fast` `/personality` `/permissions` `/sandbox` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
+`/start` `/help` `/new` `/resume` `/continue` `/reload` `/goal` `/upgrade` `/interrupt` `/cancel` `/status` `/workspace` `/addbot` `/omx` `/computer` `/model` `/fast` `/personality` `/permissions` `/sandbox` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
 
 ## Development
 
