@@ -22,6 +22,7 @@ test("parseTelegramSlashCommand returns null for plain text", () => {
 });
 
 test("recognized Codex slash commands include supported and unsupported names", () => {
+  assert.equal(isRecognizedCodexSlashCommand("goal"), true);
   assert.equal(isRecognizedCodexSlashCommand("model"), true);
   assert.equal(isRecognizedCodexSlashCommand("plan"), true);
   assert.equal(isRecognizedCodexSlashCommand("reload"), true);
@@ -72,4 +73,8 @@ test("codexSlashHelpText mentions /reload support", () => {
 
 test("codexSlashHelpText mentions /upgrade support", () => {
   assert.match(codexSlashHelpText(), /\/upgrade/);
+});
+
+test("codexSlashHelpText mentions /goal support", () => {
+  assert.match(codexSlashHelpText(), /\/goal \[status\|set <objective>\|clear]/);
 });

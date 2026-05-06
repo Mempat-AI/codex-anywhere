@@ -61,6 +61,7 @@ import {
   formatCommandCompletionHtml,
   formatFileChangeCompletionHtml,
   formatPendingInputActionHtml,
+  formatThreadGoalHtml,
   formatTurnCompletionHtml,
   formatTurnControlPromptHtml,
   renderAssistantTextHtml,
@@ -526,6 +527,9 @@ export class CodexAnywhereBridge {
         return;
       case "review":
         await this.#startReview(chatId, args);
+        return;
+      case "goal":
+        await this.#handleGoalCommand(chatId, args);
         return;
       case "rename":
         await this.#renameThread(chatId, args);
@@ -1514,6 +1518,90 @@ export class CodexAnywhereBridge {
     state.sandboxMode = mode;
     await this.#saveState();
     await this.#sendText(chatId, `Sandbox mode set to ${mode}. Applies to new turns.`);
+  }
+
+  async #handleGoalCommand(chatId: number, args: string): Promise<void> {
+    const state = this.#chatState(chatId);
+    if (!state.threadId) {
+      await this.#sendText(chatId, "No current thread. Use /resume, /continue, or send a task first.");
+      return;
+    }
+
+    const trimmed = args.trim();
+    if (!trimmed || trimmed.toLowerCase() === "status") {
+      await this.#sendThreadGoal(chatId, state.threadId);
+      return;
+    }
+
+    if (trimmed.toLowerCase() === "clear") {
+      try {
+        await this.#codex.call("thread/goal/clear", {
+          threadId: state.threadId,
+        });
+      } catch (error) {
+        if (isGoalsUnavailableError(error)) {
+          await this.#sendText(chatId, "Goals are not enabled or not supported in this Codex installation.");
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        await this.#sendText(chatId, `Failed to clear goal: ${message}`);
+        return;
+      }
+      await this.#sendText(chatId, "Goal cleared.");
+      return;
+    }
+
+    const setMatch = /^set\s+([\s\S]+)$/i.exec(trimmed);
+    if (setMatch) {
+      const objective = setMatch[1]!.trim();
+      if (!objective) {
+        await this.#sendText(chatId, "Usage: /goal set <objective>");
+        return;
+      }
+      try {
+        const response = await this.#codex.call("thread/goal/set", {
+          threadId: state.threadId,
+          objective,
+        });
+        const goal = asJsonObject(response.goal) ?? asJsonObject((response.thread as JsonObject | undefined)?.goal);
+        await this.#sendHtmlText(chatId, formatThreadGoalHtml(goal));
+      } catch (error) {
+        if (isGoalsUnavailableError(error)) {
+          await this.#sendText(chatId, "Goals are not enabled or not supported in this Codex installation.");
+          return;
+        }
+        const message = error instanceof Error ? error.message : String(error);
+        await this.#sendText(chatId, `Failed to set goal: ${message}`);
+      }
+      return;
+    }
+
+    await this.#sendText(
+      chatId,
+      [
+        "Usage: /goal",
+        "Usage: /goal status",
+        "Usage: /goal set <objective>",
+        "Usage: /goal clear",
+      ].join("\n"),
+    );
+  }
+
+  async #sendThreadGoal(chatId: number, threadId: string): Promise<void> {
+    try {
+      const response = await this.#codex.call("thread/goal/get", {
+        threadId,
+      });
+      const goal = asJsonObject(response.goal) ?? asJsonObject((response.thread as JsonObject | undefined)?.goal);
+      await this.#sendHtmlText(chatId, formatThreadGoalHtml(goal));
+    } catch (error) {
+      if (isGoalsUnavailableError(error)) {
+        await this.#sendText(chatId, "Goals are not enabled or not supported in this Codex installation.");
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      await this.#sendText(chatId, `Failed to read goal: ${message}`);
+    }
   }
 
   async #clearThread(chatId: number): Promise<void> {
@@ -3863,6 +3951,23 @@ function parseReviewTarget(args: string): JsonObject {
   return { type: "custom", instructions: trimmed };
 }
 
+function asJsonObject(value: unknown): JsonObject | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as JsonObject
+    : null;
+}
+
+function isGoalsUnavailableError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+  return (
+    message.includes("thread/goal/")
+    || message.includes("unknown method")
+    || message.includes("\"code\":-32601")
+    || message.includes("goals are not enabled")
+    || message.includes("experimental")
+  );
+}
+
 function formatModelSummary(entry: unknown): string | null {
   if (!entry || typeof entry !== "object") {
     return null;
@@ -4108,6 +4213,7 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "new", description: "start a fresh Codex thread" },
     { command: "resume", description: "browse and continue sessions in this workspace" },
     { command: "continue", description: "browse all sessions or continue by exact id" },
+    { command: "goal", description: "show or manage the current thread goal" },
     { command: "reload", description: "reload the current thread context" },
     { command: "interrupt", description: "interrupt the active turn" },
     { command: "esc", description: "interrupt the active turn" },
