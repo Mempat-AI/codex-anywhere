@@ -126,6 +126,11 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 **Use images:**
 - send a screenshot or photo with a caption — both are included in the same Codex turn
 
+**Upload files:**
+- send a non-image file from Telegram and Codex Anywhere will attach it to the turn
+- text-like files such as `.txt`, `.log`, `.json`, and `.crash` are inlined into the prompt so Codex can read their contents directly
+- binary/non-text files fall back to a file mention in the turn
+
 **Use [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) workflows:**
 - run `$deep-interview`, `$autopilot`, and other OMX skills directly in the chat
 - use `/omx status`, `/omx doctor`, and other CLI commands via `/omx <args>`

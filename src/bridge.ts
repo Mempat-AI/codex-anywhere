@@ -300,6 +300,11 @@ export class CodexAnywhereBridge {
       return;
     }
 
+    if (hasTelegramDocument(message)) {
+      await this.#handleDocumentMessage(message, text);
+      return;
+    }
+
     if (!text) {
       return;
     }
@@ -405,6 +410,36 @@ export class CodexAnywhereBridge {
     await this.#submitChatInput(message.chat.id, input);
   }
 
+  async #handleDocumentMessage(message: TelegramMessage, caption: string): Promise<void> {
+    const downloaded = await this.#downloadTelegramDocument(message);
+    if (!downloaded) {
+      await this.#sendText(message.chat.id, "I could not read that file from Telegram.");
+      return;
+    }
+
+    const { path: filePath, name, mimeType } = downloaded;
+    const prefix = `@${name}`;
+    const input: JsonObject[] = [];
+    const textContent = await readTelegramDocumentText(filePath, name, mimeType);
+    if (textContent) {
+      input.push({
+        type: "text",
+        text: [
+          caption ? `${prefix} ${caption}` : prefix,
+          "",
+          textContent,
+        ].join("\n"),
+      });
+    } else {
+      input.push({
+        type: "text",
+        text: caption ? `${prefix} ${caption}` : prefix,
+      });
+      input.push({ type: "mention", name, path: filePath });
+    }
+    await this.#submitChatInput(message.chat.id, input);
+  }
+
   async #submitChatInput(chatId: number, input: JsonObject[]): Promise<void> {
     const state = this.#chatState(chatId);
     const preparedInput = consumePendingMention(state, input);
@@ -448,6 +483,28 @@ export class CodexAnywhereBridge {
     const bytes = await this.#telegram.downloadFile(file.file_path);
     await fs.writeFile(targetPath, bytes);
     return targetPath;
+  }
+
+  async #downloadTelegramDocument(
+    message: TelegramMessage,
+  ): Promise<{ path: string; name: string; mimeType: string | null } | null> {
+    const document = message.document;
+    if (!document || isImageDocument(document)) {
+      return null;
+    }
+
+    const file = await this.#telegram.getFile(document.file_id);
+    const extension = telegramFileExtension(file.file_path, document.file_name);
+    const name = document.file_name?.trim() || `telegram-file${extension}`;
+    const directory = path.join(os.tmpdir(), "codex-anywhere-telegram-files");
+    await fs.mkdir(directory, { recursive: true });
+    const targetPath = path.join(
+      directory,
+      `${Date.now()}-${randomBytes(4).toString("hex")}-${sanitizeTelegramFileName(name)}`,
+    );
+    const bytes = await this.#telegram.downloadFile(file.file_path);
+    await fs.writeFile(targetPath, bytes);
+    return { path: targetPath, name, mimeType: document.mime_type ?? null };
   }
 
   async #handleCallbackQuery(callback: TelegramCallbackQuery): Promise<void> {
@@ -4128,6 +4185,10 @@ function hasTelegramImage(message: TelegramMessage): boolean {
   );
 }
 
+function hasTelegramDocument(message: TelegramMessage): boolean {
+  return Boolean(message.document && !isImageDocument(message.document));
+}
+
 function bestTelegramImageFileId(message: TelegramMessage): string | null {
   if (Array.isArray(message.photo) && message.photo.length > 0) {
     return message.photo[message.photo.length - 1]?.file_id ?? null;
@@ -4145,6 +4206,67 @@ function isImageDocument(document: { mime_type?: string }): boolean {
 function telegramFileExtension(filePath: string, fileName?: string): string {
   const extension = path.extname(filePath || fileName || "");
   return extension || ".jpg";
+}
+
+function sanitizeTelegramFileName(name: string): string {
+  const trimmed = name.trim();
+  const sanitized = trimmed.replace(/[^A-Za-z0-9._-]+/g, "_");
+  return sanitized || "telegram-file";
+}
+
+async function readTelegramDocumentText(
+  filePath: string,
+  fileName: string,
+  mimeType: string | null,
+): Promise<string | null> {
+  if (!isTextLikeTelegramDocument(fileName, mimeType)) {
+    return null;
+  }
+
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    const trimmed = raw.trim();
+    if (!trimmed) {
+      return `(attached file ${fileName} is empty)`;
+    }
+    return [
+      `Attached file: ${fileName}`,
+      "```text",
+      raw.slice(0, 12000),
+      "```",
+    ].join("\n");
+  } catch {
+    return null;
+  }
+}
+
+function isTextLikeTelegramDocument(fileName: string, mimeType: string | null): boolean {
+  if (mimeType && mimeType.startsWith("text/")) {
+    return true;
+  }
+
+  const ext = path.extname(fileName).toLowerCase();
+  return [
+    ".txt",
+    ".log",
+    ".md",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".xml",
+    ".csv",
+    ".tsv",
+    ".js",
+    ".ts",
+    ".py",
+    ".rb",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".crash",
+  ].includes(ext);
 }
 
 function consumePendingMention(state: ChatSessionState, input: JsonObject[]): JsonObject[] {
