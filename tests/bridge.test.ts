@@ -182,6 +182,23 @@ function telegramMessageUpdate(text: string): TelegramUpdate {
   };
 }
 
+function telegramDocumentUpdate(document: {
+  file_id: string;
+  file_name?: string;
+  mime_type?: string;
+}, caption?: string): TelegramUpdate {
+  return {
+    update_id: 3,
+    message: {
+      message_id: 3,
+      chat: { id: 42, type: "private" },
+      from: { id: 1 },
+      caption,
+      document,
+    },
+  };
+}
+
 function telegramCallbackUpdate(data: string): TelegramUpdate {
   return {
     update_id: 2,
@@ -538,6 +555,98 @@ test("bridge recreates a fresh thread when resume reports a missing rollout", as
   assert.deepEqual(codex.calls[3]!.params?.input, [
     { type: "text", text: "Commit current changes" },
   ]);
+});
+
+test("bridge inlines text-like document uploads into the turn input", async () => {
+  const telegram = new FakeTelegram();
+  telegram.getFile = async function (): Promise<{ file_path: string }> {
+    return { file_path: "documents/report.crash" };
+  };
+  telegram.downloadFile = async function (): Promise<Buffer> {
+    return Buffer.from("crash log");
+  };
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramDocumentUpdate({
+    file_id: "doc-1",
+    file_name: "TestFlight - Envoi AI 0.1.30 (36).crash",
+    mime_type: "text/plain",
+  }));
+
+  assert.equal(codex.calls[0]!.method, "thread/start");
+  assert.equal(codex.calls[1]!.method, "turn/start");
+  const input = codex.calls[1]!.params?.input as JsonObject[];
+  assert.equal(input.length, 1);
+  assert.equal(input[0]!.type, "text");
+  assert.match(String(input[0]!.text), /@TestFlight - Envoi AI 0\.1\.30 \(36\)\.crash/);
+  assert.match(String(input[0]!.text), /Attached file: TestFlight - Envoi AI 0\.1\.30 \(36\)\.crash/);
+  assert.match(String(input[0]!.text), /```text\ncrash log\n```/);
+});
+
+test("bridge keeps document caption alongside inlined text document content", async () => {
+  const telegram = new FakeTelegram();
+  telegram.getFile = async function (): Promise<{ file_path: string }> {
+    return { file_path: "docs/incident.txt" };
+  };
+  telegram.downloadFile = async function (): Promise<Buffer> {
+    return Buffer.from("incident report");
+  };
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramDocumentUpdate({
+    file_id: "doc-2",
+    file_name: "incident.txt",
+    mime_type: "text/plain",
+  }, "This one"));
+
+  const input = codex.calls[1]!.params?.input as JsonObject[];
+  assert.equal(input.length, 1);
+  assert.equal(input[0]!.type, "text");
+  assert.match(String(input[0]!.text), /^@incident\.txt This one/);
+  assert.match(String(input[0]!.text), /Attached file: incident\.txt/);
+  assert.match(String(input[0]!.text), /```text\nincident report\n```/);
+});
+
+test("bridge falls back to a file mention for non-text documents", async () => {
+  const telegram = new FakeTelegram();
+  telegram.getFile = async function (): Promise<{ file_path: string }> {
+    return { file_path: "docs/archive.zip" };
+  };
+  telegram.downloadFile = async function (): Promise<Buffer> {
+    return Buffer.from([0, 1, 2, 3]);
+  };
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramDocumentUpdate({
+    file_id: "doc-3",
+    file_name: "archive.zip",
+    mime_type: "application/zip",
+  }, "Use this"));
+
+  assert.equal(telegram.sentMessages.length, 0);
+  const input = codex.calls[1]!.params?.input as JsonObject[];
+  assert.equal(input[0]!.type, "text");
+  assert.equal(input[0]!.text, "@archive.zip Use this");
+  assert.deepEqual(input[1], {
+    type: "mention",
+    name: "archive.zip",
+    path: String(input[1]!.path),
+  });
 });
 
 test("bridge edits the active turn control card instead of duplicating it", async () => {
