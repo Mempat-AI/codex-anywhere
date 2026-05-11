@@ -1106,7 +1106,7 @@ test("/version reports the installed package version", async () => {
   assert.match(telegram.sentMessages[0]!.text, /^codex-anywhere \d+\.\d+\.\d+/);
 });
 
-test("/upgrade installs latest package and restarts the service", async () => {
+test("/upgrade installs latest package and reinstalls the official service", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
@@ -1130,7 +1130,7 @@ test("/upgrade installs latest package and restarts the service", async () => {
     },
     {
       file: "codex-anywhere",
-      args: ["restart-service"],
+      args: ["install-service"],
       cwd: testConfig().workspaceCwd,
     },
   ]);
@@ -1138,6 +1138,7 @@ test("/upgrade installs latest package and restarts the service", async () => {
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
+  assert.match(telegram.sentMessages[1]!.text, /Reinstalling the background service/);
 });
 
 test("/upgrade rejects arguments", async () => {

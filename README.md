@@ -112,8 +112,8 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 
 **Upgrade Codex Anywhere from Telegram:**
 - send `/upgrade` to run `npm install -g codex-anywhere@latest`
-- after a successful install, Codex Anywhere restarts its background service
-- if the service was installed from a source checkout, update that checkout separately because npm upgrades only the global package
+- after a successful install, Codex Anywhere reinstalls the background service from the official npm package and restarts it
+- this intentionally repoints source-checkout services to the most recent official release so unattended upgrades load the upgraded package
 
 **Start a new session:**
 - send `/new`, or just send a task like `fix tests`
@@ -167,7 +167,7 @@ Telegram-native:
 | `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
 | `/reload` | Pull the latest context for the current session |
 | `/goal [status\|set <objective>\|clear]` | Show or manage the current thread goal |
-| `/upgrade` | Upgrade the global `codex-anywhere` package to latest and restart the service |
+| `/upgrade` | Upgrade to the latest official `codex-anywhere` release and relaunch the service |
 | `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
 | `/omx [args]` | Run [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) CLI commands from Telegram |
 | `/computer <task>` | Run a task through the bundled Computer Use plugin |

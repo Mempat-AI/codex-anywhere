@@ -2860,14 +2860,8 @@ export class CodexAnywhereBridge {
     const startLines = [
       "<b>Upgrade started</b>",
       "Installing <code>codex-anywhere@latest</code> with npm.",
-      "If installation succeeds, the background service will restart.",
+      "If installation succeeds, the background service will be reinstalled from the official package and restarted.",
     ];
-    if (isSourceRuntime()) {
-      startLines.push(
-        "",
-        "This service is currently running from a source checkout, so the global npm upgrade may not change this service until that checkout is updated.",
-      );
-    }
     await this.#sendHtmlText(
       chatId,
       startLines.join("\n"),
@@ -2890,13 +2884,13 @@ export class CodexAnywhereBridge {
         [
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
-          "Restarting Codex Anywhere now. Send /version after a few seconds to confirm.",
+          "Reinstalling the background service from the official package now. Send /version after a few seconds to confirm.",
         ].join("\n"),
       );
-      await this.#execFile("codex-anywhere", ["restart-service"], {
+      await this.#execFile("codex-anywhere", ["install-service"], {
         cwd: this.#config.workspaceCwd,
         env: process.env,
-        timeout: 30_000,
+        timeout: 60_000,
         maxBuffer: 1024 * 1024,
       });
     } catch (error) {
@@ -2906,7 +2900,7 @@ export class CodexAnywhereBridge {
         [
           "<b>Upgrade failed</b>",
           `<code>${escapeTelegramHtml(message)}</code>`,
-          "Run <code>npm install -g codex-anywhere@latest</code> and restart the service manually.",
+          "Run <code>npm install -g codex-anywhere@latest</code>, then <code>codex-anywhere install-service</code> manually.",
         ].join("\n"),
       );
     }
@@ -4372,10 +4366,6 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "quit", description: "log out of Codex" },
     { command: "stop", description: "stop background terminals" },
   ];
-}
-
-function isSourceRuntime(): boolean {
-  return process.argv.some((arg) => /(?:^|[/\\])src[/\\]cli\.ts$/.test(arg));
 }
 
 function summarizeUpgradeOutput(stdout: string, stderr: string): string {
