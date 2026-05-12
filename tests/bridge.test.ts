@@ -1269,7 +1269,9 @@ test("/upgrade installs latest package and schedules a detached official service
   assert.equal(execCalls.length, 2);
   assert.equal(execCalls[1]!.file, "sh");
   assert.deepEqual(execCalls[1]!.args.slice(0, 1), ["-c"]);
-  assert.match(execCalls[1]!.args[1]!, /nohup sh -c 'sleep 1; codex-anywhere install-service'/);
+  assert.match(execCalls[1]!.args[1]!, /nohup sh -c 'sleep 3; for attempt in 1 2 3 4 5/);
+  assert.match(execCalls[1]!.args[1]!, /codex-anywhere install-service attempt/);
+  assert.match(execCalls[1]!.args[1]!, /codex-anywhere install-service succeeded/);
   assert.match(execCalls[1]!.args[1]!, /codex-anywhere-upgrade-install-service\.log/);
   assert.equal(execCalls[1]!.cwd, testConfig().workspaceCwd);
   assert.equal(telegram.sentMessages.length, 2);
