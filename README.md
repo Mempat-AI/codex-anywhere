@@ -1,6 +1,6 @@
 # Codex Anywhere
 
-Codex Anywhere is a Telegram-native client for `codex`, helping to achieve flow state with session continuity, native codex commands and features, anytime anywhere, no extra API key.
+Codex Anywhere is a Telegram-native client for `codex`, so you can use Codex anywhere, anytime with session continuity, native Codex commands, featured `/goal` support, and first-class Oh-My-Codex workflows. Install it as a background service to operate native Codex from Telegram at your fingertips anywhere, anytime, 24/7, with no extra API key.
 
 <table width="100%">
   <tr>
@@ -17,20 +17,20 @@ Codex Anywhere is a Telegram-native client for `codex`, helping to achieve flow 
     <td width="25%" align="center" valign="top">
       <img src="docs/images/telegram-omx-support.png" alt="OMX support" width="100%" style="border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.25);" /><br/>
       <b>OMX integration</b><br/>
-      Run <a href="https://github.com/Yeachan-Heo/oh-my-codex">oh-my-codex</a> workflows and commands directly from Telegram
+      Run featured <a href="https://github.com/Yeachan-Heo/oh-my-codex">Oh-My-Codex</a> workflows and commands directly from Telegram
     </td>
     <td width="25%" align="center" valign="top">
       <img src="docs/images/telegram-new-esc.png" alt="New session and interrupt" width="100%" style="border-radius:12px;box-shadow:0 4px 20px rgba(0,0,0,0.25);" /><br/>
       <b>Turn control</b><br/>
-      Start new sessions, steer active turns, queue or interrupt on the fly
+      Start new sessions, set goals, steer active turns, queue or interrupt on the fly
     </td>
   </tr>
 </table>
 
 ## Prerequisites
 
-- **[codex](https://github.com/openai/codex)** — installed and authenticated
-- A **Telegram account** and a bot token from [@BotFather](https://t.me/BotFather)
+- **[codex](https://github.com/openai/codex)** installed and signed in
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
 
 ## Quick Start
 
@@ -49,7 +49,7 @@ codex-anywhere --version
 ### 2. Create a Telegram bot
 
 Open [@BotFather](https://t.me/BotFather) in Telegram, send `/newbot`, and follow the prompts.
-Copy the bot token it gives you — you'll need it in the next step.
+Copy the bot token for the next step.
 
 ### 3. Connect
 
@@ -62,7 +62,7 @@ Telegram bot token (from BotFather): <paste your token here>
 Workspace path for Codex tasks [/current/dir]:  ← press Enter to accept
 ```
 
-The workspace defaults to wherever you run `connect` from. The setup validates the token, checks that `codex` is on `PATH`, and starts the bridge.
+The workspace defaults to the folder where you run `connect`.
 
 ### Add another Telegram bot
 
@@ -70,8 +70,7 @@ The workspace defaults to wherever you run `connect` from. The setup validates t
 codex-anywhere add-bot
 ```
 
-This appends one bot definition to the shared config. After saving, restart the service or rerun `connect` to launch the new bot.
-If your install still uses the older single-bot config, run `codex-anywhere connect` once first so it can migrate to the current protocol.
+Use this when you want another bot pointed at another workspace.
 
 ### 4. Install the background service
 
@@ -80,7 +79,7 @@ codex-anywhere install-service
 ```
 
 This registers a LaunchAgent (macOS) so the bot starts at login and keeps running when the terminal closes.
-On Linux, it installs a user-level `systemd` service under `~/.config/systemd/user` and enables it immediately.
+On Linux, it installs a user-level `systemd` service.
 
 ### 5. Open Telegram and send `/start`
 
@@ -88,68 +87,22 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 
 ## Usage
 
-**Resume an existing Codex session:**
-- send `/resume` to browse sessions in the current workspace
-- session lists are paginated at 8 items per page
-- tap `Take Over` to bind the Telegram chat to that session
+Send a task to start a new Codex session, or use these commands:
 
-**Continue from any workspace:**
-- send `/continue` to browse sessions globally
-- send `/continue <session-id>` to continue a specific session directly
-- global session lists are paginated at 8 items per page
-- if the target session belongs to another workspace, Codex Anywhere asks before switching workspace
-- after takeover, Codex Anywhere shows a compact preview of the last 3 turns to restore context
+- `/new` starts fresh
+- `/resume` continues a session from the current workspace
+- `/continue` browses sessions from all workspaces
+- `/reload` refreshes the current session
+- `/goal` shows or changes the current goal
+- `/account` shows, signs in, switches, or signs out of Codex
+- `/upgrade` updates Codex Anywhere and relaunches the service
+- `/esc` stops the active turn
 
-**Reload the current session:**
-- send `/reload` to pull the latest context for the currently bound session
-- `/reload` never browses, switches, or selects another session
+You can also send screenshots, photos, and files. Text files such as `.txt`, `.log`, `.json`, and `.crash` are sent as readable text so Codex can inspect them directly.
 
-**Manage thread goals:**
-- send `/goal` or `/goal status` to inspect the current thread goal
-- send `/goal set <objective>` to create or replace the current thread goal
-- send `/goal clear` to remove the current thread goal
-- goals require the local Codex installation to have the experimental `goals` feature enabled
+For Oh-My-Codex, send `$deep-interview`, `$autopilot`, or other skills directly in chat. Use `/omx <args>` for OMX commands.
 
-**Manage the active Codex account:**
-- send `/account` or `/account status` to show the Codex account used by new turns
-- send `/account login` to start the ChatGPT device-code sign-in flow
-- send `/account switch` to log out and start a new device-code sign-in flow
-- send `/account logout` to sign out
-- sessions are local data; new and resumed turns use whichever Codex account is currently signed in
-
-**Upgrade Codex Anywhere from Telegram:**
-- send `/upgrade` to run `npm install -g codex-anywhere@latest`
-- after a successful install, Codex Anywhere schedules a detached service reinstall from the official npm package
-- this intentionally repoints source-checkout services to the most recent official release so unattended upgrades load the upgraded package
-
-**Start a new session:**
-- send `/new`, or just send a task like `fix tests`
-
-**Steer an active turn:**
-- send a follow-up message to redirect mid-turn
-- use `Queue Next` to stage the next message without interrupting
-- use `Interrupt` (or `/esc`) to stop the current turn
-
-**Use images:**
-- send a screenshot or photo with a caption — both are included in the same Codex turn
-
-**Upload files:**
-- send a non-image file from Telegram and Codex Anywhere will attach it to the turn
-- text-like files such as `.txt`, `.log`, `.json`, and `.crash` are inlined into the prompt so Codex can read their contents directly
-- binary/non-text files fall back to a file mention in the turn
-
-**Use [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) workflows:**
-- run `$deep-interview`, `$autopilot`, and other OMX skills directly in the chat
-- use `/omx status`, `/omx doctor`, and other CLI commands via `/omx <args>`
-
-**Use Computer Use:**
-- send `/computer <task>` to route a task through the bundled Computer Use plugin
-- Computer Use must be enabled from the Codex app before `/computer` can control the desktop
-
-**Add another bot from Telegram:**
-- send `/addbot` from the currently paired admin bot
-- reply with bot id, label, BotFather token, and workspace path
-- the new bot is added to shared config and started immediately in the running supervisor
+For Computer Use, send `/computer <task>`. Enable Computer Use in the Codex app first.
 
 ## Service Management
 
@@ -160,32 +113,24 @@ codex-anywhere uninstall-service
 ```
 
 Logs are written to `logs/` under the Codex Anywhere storage root (`CODEX_ANYWHERE_HOME`).
-Multi-bot installs also keep bot state under `bots/<bot-id>/state.json` and shared session ownership in `session-ownership.json`.
 
 ## Telegram Commands
-
-Telegram-native:
 
 | Command | Description |
 |---|---|
 | `/workspace <path>` | Show or change the bot workspace |
-| `/addbot` | Add and start another Telegram bot from chat |
-| `/resume` | Browse and continue sessions in the current workspace |
-| `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
-| `/reload` | Pull the latest context for the current session |
-| `/account [status\|login\|switch\|logout]` | Show, sign in, switch, or sign out of the active Codex account |
-| `/goal [status\|set <objective>\|clear]` | Show or manage the current thread goal |
-| `/upgrade` | Upgrade to the latest official `codex-anywhere` release and relaunch the service |
-| `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
-| `/omx [args]` | Run [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) CLI commands from Telegram |
-| `/computer <task>` | Run a task through the bundled Computer Use plugin |
-| `/esc` `/ese` | Interrupt aliases |
+| `/addbot` | Add another Telegram bot |
+| `/resume` | Continue a session in this workspace |
+| `/continue [session-id]` | Continue from any workspace |
+| `/reload` | Refresh the current session |
+| `/account [status\|login\|switch\|logout]` | Manage Codex sign-in |
+| `/goal [status\|set <objective>\|clear]` | Manage the current goal |
+| `/upgrade` | Upgrade Codex Anywhere |
+| `/omx [args]` | Run Oh-My-Codex commands |
+| `/computer <task>` | Use Computer Use |
+| `/esc` | Interrupt the active turn |
 
-Supported Telegram command surface:
-
-This includes Telegram-native bridge commands plus Codex slash commands forwarded or adapted by Codex Anywhere.
-
-`/start` `/help` `/new` `/resume` `/continue` `/reload` `/account` `/goal` `/upgrade` `/interrupt` `/cancel` `/status` `/workspace` `/addbot` `/omx` `/computer` `/model` `/fast` `/personality` `/permissions` `/sandbox` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
+Many native Codex slash commands also work from Telegram, including `/model`, `/permissions`, `/sandbox`, `/review`, `/compact`, `/diff`, `/mention`, `/mcp`, `/apps`, and `/logout`.
 
 ## Development
 
@@ -207,7 +152,7 @@ pnpm run typecheck
 pnpm run build
 ```
 
-The `test` lane is fully local and deterministic — no real Telegram, `codex`, `omx`, or network access. CI covers mocked E2E startup, routing, `/omx` commands, session continuity flows, and preflight failure paths.
+Tests are local and do not require Telegram, Codex, OMX, or network access.
 
 ## Contributing
 
@@ -217,8 +162,6 @@ Repository policy:
 - PR title gate
 - CI gate
 - squash merge only
-- no merge commits
-- no rebase merges
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution rules.
 
@@ -227,7 +170,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution rules.
 - Single-user (for now), private chats only
 - `codex` must be installed and authenticated before setup
 - Config and state live under the user config directory or `CODEX_ANYWHERE_HOME`
-- Background service install supports macOS LaunchAgent and Linux user-level `systemd`
+- Background services support macOS LaunchAgent and Linux user-level `systemd`
 
 ---
 
