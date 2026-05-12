@@ -4467,7 +4467,20 @@ function summarizeUpgradeOutput(stdout: string, stderr: string): string {
 
 function buildDetachedServiceInstallCommand(): string {
   const logPath = path.join(os.tmpdir(), "codex-anywhere-upgrade-install-service.log");
-  return `nohup sh -c ${shellQuote("sleep 1; codex-anywhere install-service")} >${shellQuote(logPath)} 2>&1 &`;
+  const script = [
+    "sleep 3",
+    "for attempt in 1 2 3 4 5; do",
+    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service attempt ${attempt}\"",
+    "  if codex-anywhere install-service; then",
+    "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service succeeded\"",
+    "    exit 0",
+    "  fi",
+    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service failed\"",
+    "  sleep 3",
+    "done",
+    "exit 1",
+  ].join("; ");
+  return `nohup sh -c ${shellQuote(script)} >${shellQuote(logPath)} 2>&1 &`;
 }
 
 function shellQuote(value: string): string {
