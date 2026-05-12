@@ -1090,6 +1090,143 @@ test("/goal reports feature-unavailable failures cleanly", async () => {
   assert.match(telegram.sentMessages[0]!.text, /Goals are not enabled or not supported/);
 });
 
+test("/account shows the active Codex account", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "account/read") {
+      return {
+        account: {
+          type: "chatgpt",
+          email: "user@example.com",
+          planType: "pro",
+        },
+        requiresOpenaiAuth: true,
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/account"));
+
+  assert.deepEqual(codex.calls, [{ method: "account/read", params: { refreshToken: false } }]);
+  assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
+  assert.match(telegram.sentMessages[0]!.text, /user@example\.com/);
+  assert.match(telegram.sentMessages[0]!.text, /pro/);
+});
+
+test("/account login starts the ChatGPT device-code flow", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "account/login/start") {
+      return {
+        type: "chatgptDeviceCode",
+        loginId: "login-1",
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "ABCD-1234",
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/account login"));
+
+  assert.deepEqual(codex.calls, [
+    { method: "account/login/start", params: { type: "chatgptDeviceCode" } },
+  ]);
+  assert.match(telegram.sentMessages[0]!.text, /ABCD-1234/);
+  assert.match(telegram.sentMessages[0]!.text, /auth\.openai\.com/);
+});
+
+test("/account switch logs out before starting login", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "account/logout") {
+      return {};
+    }
+    if (method === "account/login/start") {
+      return {
+        type: "chatgptDeviceCode",
+        loginId: "login-1",
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "ABCD-1234",
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/account switch"));
+
+  assert.deepEqual(codex.calls, [
+    { method: "account/logout", params: undefined },
+    { method: "account/login/start", params: { type: "chatgptDeviceCode" } },
+  ]);
+  assert.match(telegram.sentMessages[0]!.text, /account switch started/);
+});
+
+test("account login completion reports the refreshed account", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "account/login/start") {
+      return {
+        type: "chatgptDeviceCode",
+        loginId: "login-1",
+        verificationUrl: "https://auth.openai.com/codex/device",
+        userCode: "ABCD-1234",
+      };
+    }
+    if (method === "account/read") {
+      return {
+        account: {
+          type: "chatgpt",
+          email: "new@example.com",
+          planType: "plus",
+        },
+        requiresOpenaiAuth: true,
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/account login"));
+  await bridge.handleNotificationForTest("account/login/completed", {
+    loginId: "login-1",
+    success: true,
+    error: null,
+  });
+
+  assert.equal(codex.calls[1]!.method, "account/read");
+  assert.deepEqual(codex.calls[1]!.params, { refreshToken: true });
+  assert.match(telegram.sentMessages[1]!.text, /new@example\.com/);
+});
+
 test("/version reports the installed package version", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
@@ -1106,7 +1243,7 @@ test("/version reports the installed package version", async () => {
   assert.match(telegram.sentMessages[0]!.text, /^codex-anywhere \d+\.\d+\.\d+/);
 });
 
-test("/upgrade installs latest package and restarts the service", async () => {
+test("/upgrade installs latest package and schedules a detached official service relaunch", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
@@ -1122,22 +1259,24 @@ test("/upgrade installs latest package and restarts the service", async () => {
 
   await bridge.handleUpdateForTest(telegramMessageUpdate("/upgrade"));
 
-  assert.deepEqual(execCalls, [
+  assert.deepEqual(execCalls.slice(0, 1), [
     {
       file: "npm",
       args: ["install", "-g", "codex-anywhere@latest"],
       cwd: testConfig().workspaceCwd,
     },
-    {
-      file: "codex-anywhere",
-      args: ["restart-service"],
-      cwd: testConfig().workspaceCwd,
-    },
   ]);
+  assert.equal(execCalls.length, 2);
+  assert.equal(execCalls[1]!.file, "sh");
+  assert.deepEqual(execCalls[1]!.args.slice(0, 1), ["-c"]);
+  assert.match(execCalls[1]!.args[1]!, /nohup sh -c 'sleep 1; codex-anywhere install-service'/);
+  assert.match(execCalls[1]!.args[1]!, /codex-anywhere-upgrade-install-service\.log/);
+  assert.equal(execCalls[1]!.cwd, testConfig().workspaceCwd);
   assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
+  assert.match(telegram.sentMessages[1]!.text, /detached service relaunch/);
 });
 
 test("/upgrade rejects arguments", async () => {

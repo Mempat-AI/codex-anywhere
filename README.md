@@ -110,10 +110,17 @@ Your bot is ready. Try `/help` to see available commands, or just send a task to
 - send `/goal clear` to remove the current thread goal
 - goals require the local Codex installation to have the experimental `goals` feature enabled
 
+**Manage the active Codex account:**
+- send `/account` or `/account status` to show the Codex account used by new turns
+- send `/account login` to start the ChatGPT device-code sign-in flow
+- send `/account switch` to log out and start a new device-code sign-in flow
+- send `/account logout` to sign out
+- sessions are local data; new and resumed turns use whichever Codex account is currently signed in
+
 **Upgrade Codex Anywhere from Telegram:**
 - send `/upgrade` to run `npm install -g codex-anywhere@latest`
-- after a successful install, Codex Anywhere restarts its background service
-- if the service was installed from a source checkout, update that checkout separately because npm upgrades only the global package
+- after a successful install, Codex Anywhere schedules a detached service reinstall from the official npm package
+- this intentionally repoints source-checkout services to the most recent official release so unattended upgrades load the upgraded package
 
 **Start a new session:**
 - send `/new`, or just send a task like `fix tests`
@@ -166,8 +173,9 @@ Telegram-native:
 | `/resume` | Browse and continue sessions in the current workspace |
 | `/continue [session-id]` | Browse all sessions globally or continue by exact session id |
 | `/reload` | Pull the latest context for the current session |
+| `/account [status\|login\|switch\|logout]` | Show, sign in, switch, or sign out of the active Codex account |
 | `/goal [status\|set <objective>\|clear]` | Show or manage the current thread goal |
-| `/upgrade` | Upgrade the global `codex-anywhere` package to latest and restart the service |
+| `/upgrade` | Upgrade to the latest official `codex-anywhere` release and relaunch the service |
 | `/verbose [on\|off\|status]` | Toggle detailed tool/file output cards |
 | `/omx [args]` | Run [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex) CLI commands from Telegram |
 | `/computer <task>` | Run a task through the bundled Computer Use plugin |
@@ -177,7 +185,7 @@ Supported Telegram command surface:
 
 This includes Telegram-native bridge commands plus Codex slash commands forwarded or adapted by Codex Anywhere.
 
-`/start` `/help` `/new` `/resume` `/continue` `/reload` `/goal` `/upgrade` `/interrupt` `/cancel` `/status` `/workspace` `/addbot` `/omx` `/computer` `/model` `/fast` `/personality` `/permissions` `/sandbox` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
+`/start` `/help` `/new` `/resume` `/continue` `/reload` `/account` `/goal` `/upgrade` `/interrupt` `/cancel` `/status` `/workspace` `/addbot` `/omx` `/computer` `/model` `/fast` `/personality` `/permissions` `/sandbox` `/plan` `/collab` `/agent` `/subagents` `/review` `/rename` `/fork` `/compact` `/clear` `/diff` `/copy` `/mention` `/skills` `/mcp` `/apps` `/plugins` `/feedback` `/experimental` `/rollout` `/logout` `/quit` `/exit` `/stop`
 
 ## Development
 

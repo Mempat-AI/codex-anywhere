@@ -145,6 +145,7 @@ export class CodexAnywhereBridge {
   readonly #pendingSessionPages = new Map<string, { chatId: number; global: boolean; cursor: string }>();
   readonly #pendingInteractiveSessions = new Map<string, PendingInteractiveSession>();
   readonly #pendingInteractiveSessionByChat = new Map<number, string>();
+  readonly #pendingAccountLogins = new Map<string, number>();
   readonly #items = new Map<string, JsonObject>();
   readonly #streams = new Map<string, StreamBuffer>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
@@ -587,6 +588,9 @@ export class CodexAnywhereBridge {
         return;
       case "goal":
         await this.#handleGoalCommand(chatId, args);
+        return;
+      case "account":
+        await this.#handleAccountCommand(chatId, args);
         return;
       case "rename":
         await this.#renameThread(chatId, args);
@@ -1807,7 +1811,70 @@ export class CodexAnywhereBridge {
 
   async #logoutAccount(chatId: number): Promise<void> {
     await this.#codex.call("account/logout");
-    await this.#sendText(chatId, "Logged out of Codex.");
+    await this.#sendHtmlText(chatId, "<b>Codex account</b>\nLogged out.");
+  }
+
+  async #handleAccountCommand(chatId: number, args: string): Promise<void> {
+    const trimmed = args.trim();
+    const [actionRaw, ...rest] = trimmed.split(/\s+/).filter(Boolean);
+    const action = actionRaw?.toLowerCase() ?? "status";
+    const remainder = rest.join(" ");
+
+    if (action === "status" || action === "read") {
+      await this.#sendAccountStatus(chatId, false);
+      return;
+    }
+    if (action === "refresh") {
+      await this.#sendAccountStatus(chatId, true);
+      return;
+    }
+    if (action === "logout") {
+      await this.#logoutAccount(chatId);
+      return;
+    }
+    if (action === "login") {
+      await this.#startAccountLogin(chatId, remainder, false);
+      return;
+    }
+    if (action === "switch") {
+      await this.#startAccountLogin(chatId, remainder, true);
+      return;
+    }
+
+    await this.#sendHtmlText(
+      chatId,
+      [
+        "<b>Usage</b>",
+        "<code>/account</code>",
+        "<code>/account login</code>",
+        "<code>/account switch</code>",
+        "<code>/account logout</code>",
+      ].join("\n"),
+    );
+  }
+
+  async #sendAccountStatus(chatId: number, refreshToken: boolean): Promise<void> {
+    const response = await this.#codex.call("account/read", { refreshToken });
+    await this.#sendHtmlText(chatId, formatAccountStatusHtml(response));
+  }
+
+  async #startAccountLogin(chatId: number, args: string, switchAccount: boolean): Promise<void> {
+    const parsed = parseAccountLoginArgs(args);
+    if (!parsed.ok) {
+      await this.#sendHtmlText(chatId, parsed.message);
+      return;
+    }
+
+    if (switchAccount) {
+      await this.#codex.call("account/logout");
+    }
+
+    const response = await this.#codex.call("account/login/start", parsed.params);
+    await this.#sendHtmlText(chatId, formatAccountLoginStartedHtml(response, switchAccount));
+    const loginId = asString(response.loginId);
+    if (loginId) {
+      this.#pendingAccountLogins.set(loginId, chatId);
+    }
   }
 
   async #stopBackgroundTerminals(chatId: number): Promise<void> {
@@ -2525,6 +2592,27 @@ export class CodexAnywhereBridge {
   async #handleNotification(method: string, params: JsonObject): Promise<void> {
     const threadId = typeof params.threadId === "string" ? params.threadId : null;
 
+    if (method === "account/login/completed") {
+      const loginId = asString(params.loginId);
+      const chatId = loginId ? this.#pendingAccountLogins.get(loginId) : null;
+      if (loginId) {
+        this.#pendingAccountLogins.delete(loginId);
+      }
+      if (chatId === null || chatId === undefined) {
+        return;
+      }
+      if (params.success === true) {
+        await this.#sendAccountStatus(chatId, true);
+        return;
+      }
+      const error = asString(params.error) ?? "Login was not completed.";
+      await this.#sendHtmlText(
+        chatId,
+        `<b>Codex login failed</b>\n${escapeTelegramHtml(error)}`,
+      );
+      return;
+    }
+
     if (method === "item/started") {
       const item = params.item as JsonObject | undefined;
       if (item && typeof item.id === "string") {
@@ -2860,14 +2948,8 @@ export class CodexAnywhereBridge {
     const startLines = [
       "<b>Upgrade started</b>",
       "Installing <code>codex-anywhere@latest</code> with npm.",
-      "If installation succeeds, the background service will restart.",
+      "If installation succeeds, the background service will be reinstalled from the official package and restarted.",
     ];
-    if (isSourceRuntime()) {
-      startLines.push(
-        "",
-        "This service is currently running from a source checkout, so the global npm upgrade may not change this service until that checkout is updated.",
-      );
-    }
     await this.#sendHtmlText(
       chatId,
       startLines.join("\n"),
@@ -2890,13 +2972,13 @@ export class CodexAnywhereBridge {
         [
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
-          "Restarting Codex Anywhere now. Send /version after a few seconds to confirm.",
+          "Scheduling a detached service relaunch from the official package now. Send /version after a few seconds to confirm.",
         ].join("\n"),
       );
-      await this.#execFile("codex-anywhere", ["restart-service"], {
+      await this.#execFile("sh", ["-c", buildDetachedServiceInstallCommand()], {
         cwd: this.#config.workspaceCwd,
         env: process.env,
-        timeout: 30_000,
+        timeout: 10_000,
         maxBuffer: 1024 * 1024,
       });
     } catch (error) {
@@ -2906,7 +2988,7 @@ export class CodexAnywhereBridge {
         [
           "<b>Upgrade failed</b>",
           `<code>${escapeTelegramHtml(message)}</code>`,
-          "Run <code>npm install -g codex-anywhere@latest</code> and restart the service manually.",
+          "Run <code>npm install -g codex-anywhere@latest</code>, then <code>codex-anywhere install-service</code> manually.",
         ].join("\n"),
       );
     }
@@ -4335,6 +4417,7 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "new", description: "start a fresh Codex thread" },
     { command: "resume", description: "browse and continue sessions in this workspace" },
     { command: "continue", description: "browse all sessions or continue by exact id" },
+    { command: "account", description: "show, login, switch, or logout Codex account" },
     { command: "goal", description: "show or manage the current thread goal" },
     { command: "reload", description: "reload the current thread context" },
     { command: "interrupt", description: "interrupt the active turn" },
@@ -4374,16 +4457,106 @@ function telegramCommands(): TelegramBotCommand[] {
   ];
 }
 
-function isSourceRuntime(): boolean {
-  return process.argv.some((arg) => /(?:^|[/\\])src[/\\]cli\.ts$/.test(arg));
-}
-
 function summarizeUpgradeOutput(stdout: string, stderr: string): string {
   const lines = `${stdout}\n${stderr}`
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   return lines.slice(-6).join("\n") || "npm install completed";
+}
+
+function buildDetachedServiceInstallCommand(): string {
+  const logPath = path.join(os.tmpdir(), "codex-anywhere-upgrade-install-service.log");
+  return `nohup sh -c ${shellQuote("sleep 1; codex-anywhere install-service")} >${shellQuote(logPath)} 2>&1 &`;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
+function parseAccountLoginArgs(args: string): { ok: true; params: JsonObject } | { ok: false; message: string } {
+  const trimmed = args.trim();
+  if (!trimmed || trimmed === "chatgpt" || trimmed === "device" || trimmed === "device-code") {
+    return { ok: true, params: { type: "chatgptDeviceCode" } };
+  }
+  if (trimmed === "browser") {
+    return { ok: true, params: { type: "chatgpt" } };
+  }
+  const apiKeyMatch = /^(?:api-key|apikey)\s+(.+)$/.exec(trimmed);
+  if (apiKeyMatch) {
+    return { ok: true, params: { type: "apiKey", apiKey: apiKeyMatch[1]!.trim() } };
+  }
+  return {
+    ok: false,
+    message: [
+      "<b>Usage</b>",
+      "<code>/account login</code>",
+      "<code>/account login browser</code>",
+      "<code>/account login api-key &lt;key&gt;</code>",
+      "<code>/account switch</code>",
+    ].join("\n"),
+  };
+}
+
+function formatAccountStatusHtml(response: JsonObject): string {
+  const account = response.account && typeof response.account === "object"
+    ? (response.account as JsonObject)
+    : null;
+  const requiresOpenaiAuth = response.requiresOpenaiAuth === true ? "yes" : "no";
+  if (!account) {
+    return [
+      "<b>Codex account</b>",
+      "",
+      "Signed out.",
+      `Requires OpenAI auth: <code>${requiresOpenaiAuth}</code>`,
+      "",
+      "Use <code>/account login</code> to sign in.",
+    ].join("\n");
+  }
+
+  const type = asString(account.type) ?? "unknown";
+  const email = asString(account.email);
+  const planType = asString(account.planType);
+  const lines = [
+    "<b>Codex account</b>",
+    "",
+    `Type: <code>${escapeTelegramHtml(type)}</code>`,
+  ];
+  if (email) {
+    lines.push(`Email: <code>${escapeTelegramHtml(email)}</code>`);
+  }
+  if (planType) {
+    lines.push(`Plan: <code>${escapeTelegramHtml(planType)}</code>`);
+  }
+  lines.push(`Requires OpenAI auth: <code>${requiresOpenaiAuth}</code>`);
+  return lines.join("\n");
+}
+
+function formatAccountLoginStartedHtml(response: JsonObject, switched: boolean): string {
+  const type = asString(response.type) ?? "unknown";
+  const verificationUrl = asString(response.verificationUrl);
+  const userCode = asString(response.userCode);
+  const authUrl = asString(response.authUrl);
+  const lines = [
+    switched ? "<b>Codex account switch started</b>" : "<b>Codex login started</b>",
+    "",
+    `Type: <code>${escapeTelegramHtml(type)}</code>`,
+  ];
+  if (verificationUrl) {
+    lines.push(`Open: ${escapeTelegramHtml(verificationUrl)}`);
+  }
+  if (userCode) {
+    lines.push(`Code: <code>${escapeTelegramHtml(userCode)}</code>`);
+  }
+  if (authUrl) {
+    lines.push(`Open: ${escapeTelegramHtml(authUrl)}`);
+  }
+  if (!verificationUrl && !userCode && !authUrl) {
+    lines.push("Login completed.");
+  } else {
+    lines.push("", "After approval, Codex Anywhere will report the active account.");
+  }
+  return lines.join("\n");
 }
 
 function buildToolInteractiveStep(

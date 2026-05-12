@@ -78,3 +78,8 @@ test("codexSlashHelpText mentions /upgrade support", () => {
 test("codexSlashHelpText mentions /goal support", () => {
   assert.match(codexSlashHelpText(), /\/goal \[status\|set <objective>\|clear]/);
 });
+
+test("codexSlashHelpText mentions /account support", () => {
+  assert.equal(isRecognizedCodexSlashCommand("account"), true);
+  assert.match(codexSlashHelpText(), /\/account \[status\|login\|switch\|logout]/);
+});

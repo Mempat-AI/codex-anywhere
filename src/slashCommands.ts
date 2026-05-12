@@ -7,6 +7,7 @@ export interface ParsedTelegramSlashCommand {
 
 const SUPPORTED_CODEX_COMMANDS = new Set([
   "approvals",
+  "account",
   "agent",
   "apps",
   "clear",
@@ -118,6 +119,7 @@ export function isUnsupportedTelegramOnlyCodexCommand(name: string): boolean {
 export function isTaskBlockingSlashCommand(name: string): boolean {
   return new Set([
     "approvals",
+    "account",
     "clear",
     "compact",
     "experimental",
@@ -162,6 +164,7 @@ export function codexSlashHelpText(): string {
     "Telegram will also show the registered command list when you type /",
     "",
     "Bridge-managed commands and bridged Codex slash commands:",
+    "/account [status|login|switch|logout]",
     "/goal [status|set <objective>|clear]",
     "/model [status|reset|<model> [effort]]",
     "/fast [status|on|off]",
