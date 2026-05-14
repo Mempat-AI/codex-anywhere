@@ -445,7 +445,7 @@ function summarizePathLikeArg(command: string): string | null {
 }
 
 // Render a plain-text markdown segment (not inside code fences/spans).
-// Handles ATX headings, horizontal rules, bullet lists, and **bold** markers.
+// Handles ATX headings, horizontal rules, bullet lists, links, and **bold** markers.
 function renderPlainMarkdown(text: string): string {
   const lines = text.split("\n");
   return lines
@@ -458,27 +458,27 @@ function renderPlainMarkdown(text: string): string {
       const headingMatch = /^(#{1,3}) (.+)$/.exec(line);
       if (headingMatch) {
         const prefix = idx > 0 ? "\n" : "";
-        return `${prefix}<b>${renderBoldMarkdown(headingMatch[2]!)}</b>`;
+        return `${prefix}<b>${renderInlineMarkdown(headingMatch[2]!)}</b>`;
       }
       // Unordered list items: - … / * …
       const bulletMatch = /^(\s*)[*-] (.+)$/.exec(line);
       if (bulletMatch) {
         const indent = bulletMatch[1]!.length > 0 ? "  " : "";
-        return `${indent}• ${renderBoldMarkdown(bulletMatch[2]!)}`;
+        return `${indent}• ${renderInlineMarkdown(bulletMatch[2]!)}`;
       }
       // Ordered list items: 1. …
       const orderedMatch = /^(\s*)(\d+)\. (.+)$/.exec(line);
       if (orderedMatch) {
         const indent = orderedMatch[1]!.length > 0 ? "  " : "";
-        return `${indent}${orderedMatch[2]}. ${renderBoldMarkdown(orderedMatch[3]!)}`;
+        return `${indent}${orderedMatch[2]}. ${renderInlineMarkdown(orderedMatch[3]!)}`;
       }
-      return renderBoldMarkdown(line);
+      return renderInlineMarkdown(line);
     })
     .join("\n");
 }
 
-// Render **bold** markers within a single line of plain text.
-function renderBoldMarkdown(text: string): string {
+// Render simple inline Markdown within a single line of plain text.
+function renderInlineMarkdown(text: string): string {
   let result = "";
   let i = 0;
   let plainStart = 0;
@@ -490,6 +490,16 @@ function renderBoldMarkdown(text: string): string {
   };
 
   while (i < text.length) {
+    if (text[i] === "[") {
+      const link = parseMarkdownLink(text, i);
+      if (link) {
+        flush(i);
+        result += renderMarkdownLink(link.label, link.target);
+        i = link.nextIndex;
+        plainStart = i;
+        continue;
+      }
+    }
     if (text[i] === "*" && text[i + 1] === "*") {
       const closeIdx = text.indexOf("**", i + 2);
       if (closeIdx > i + 1) {
@@ -504,6 +514,59 @@ function renderBoldMarkdown(text: string): string {
   }
   flush(i);
   return result;
+}
+
+function parseMarkdownLink(
+  text: string,
+  start: number,
+): { label: string; target: string; nextIndex: number } | null {
+  const closeLabel = text.indexOf("](", start + 1);
+  if (closeLabel <= start + 1) {
+    return null;
+  }
+
+  let depth = 1;
+  let cursor = closeLabel + 2;
+  while (cursor < text.length) {
+    const char = text[cursor];
+    if (char === "(") depth += 1;
+    if (char === ")") {
+      depth -= 1;
+      if (depth === 0) {
+        return {
+          label: text.slice(start + 1, closeLabel),
+          target: text.slice(closeLabel + 2, cursor),
+          nextIndex: cursor + 1,
+        };
+      }
+    }
+    cursor += 1;
+  }
+  return null;
+}
+
+function renderMarkdownLink(label: string, target: string): string {
+  const trimmedTarget = target.trim();
+  if (/^https?:\/\//i.test(trimmedTarget)) {
+    return `<a href="${escapeTelegramHtml(trimmedTarget)}">${escapeTelegramHtml(label)}</a>`;
+  }
+  if (isLocalPathTarget(trimmedTarget)) {
+    return `<code>${escapeTelegramHtml(formatLocalPathLabel(label, trimmedTarget))}</code>`;
+  }
+  return `${escapeTelegramHtml(label)} (${escapeTelegramHtml(trimmedTarget)})`;
+}
+
+function isLocalPathTarget(target: string): boolean {
+  return /^(?:\/|~\/|\.{1,2}\/)/.test(target);
+}
+
+function formatLocalPathLabel(label: string, target: string): string {
+  const lineMatch = /:(\d+)(?::\d+)?$/.exec(target);
+  const lineSuffix = lineMatch ? `:${lineMatch[1]}` : "";
+  if (lineSuffix && !label.endsWith(lineSuffix)) {
+    return `${label}${lineSuffix}`;
+  }
+  return label;
 }
 
 function renderCodeFence(

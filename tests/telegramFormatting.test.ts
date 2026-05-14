@@ -204,6 +204,22 @@ test("renderAssistantTextHtml renders ATX headings as bold", () => {
   assert.equal(html, "<b>Summary</b>\nsome text");
 });
 
+test("renderAssistantTextHtml renders web markdown links", () => {
+  const html = renderAssistantTextHtml("Open [docs](https://example.com?a=1&b=2).");
+  assert.equal(html, 'Open <a href="https://example.com?a=1&amp;b=2">docs</a>.');
+});
+
+test("renderAssistantTextHtml compacts local markdown file links", () => {
+  const html = renderAssistantTextHtml(
+    "- [workstreams/[sessionId]/page.tsx](/Users/twocode/project/app/(studio)/workstreams/[sessionId]/page.tsx:166): Runtime history",
+  );
+  assert.equal(
+    html,
+    "• <code>workstreams/[sessionId]/page.tsx:166</code>: Runtime history",
+  );
+  assert.doesNotMatch(html, /Users\/twocode/);
+});
+
 test("renderAssistantTextHtml does not bold inside code fences", () => {
   const html = renderAssistantTextHtml("```\n**not bold**\n```");
   assert.match(html, /\*\*not bold\*\*/);
