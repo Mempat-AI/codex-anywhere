@@ -40,6 +40,14 @@ class FakeTelegram {
 
   async sendChatAction(): Promise<void> {}
 
+  async sendDocument(): Promise<{ message_id: number }> {
+    return { message_id: this.sentMessages.length + 1 };
+  }
+
+  async sendPhoto(): Promise<{ message_id: number }> {
+    return { message_id: this.sentMessages.length + 1 };
+  }
+
   async sendMessage(
     chatId: number,
     text: string,

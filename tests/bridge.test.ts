@@ -19,6 +19,8 @@ import type {
 
 class FakeTelegram {
   readonly sentMessages: Array<{ chatId: number; text: string; replyMarkup?: JsonObject; parseMode?: string }> = [];
+  readonly sentDocuments: Array<{ chatId: number; filePath: string; caption?: string }> = [];
+  readonly sentPhotos: Array<{ chatId: number; filePath: string; caption?: string }> = [];
   readonly editedMessages: Array<{
     chatId: number;
     messageId: number;
@@ -52,6 +54,16 @@ class FakeTelegram {
   ): Promise<{ message_id: number }> {
     this.sentMessages.push({ chatId, text, replyMarkup, parseMode });
     return { message_id: this.sentMessages.length };
+  }
+
+  async sendDocument(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
+    this.sentDocuments.push({ chatId, filePath, caption });
+    return { message_id: this.sentMessages.length + this.sentDocuments.length + this.sentPhotos.length };
+  }
+
+  async sendPhoto(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
+    this.sentPhotos.push({ chatId, filePath, caption });
+    return { message_id: this.sentMessages.length + this.sentDocuments.length + this.sentPhotos.length };
   }
 
   async editMessageText(
@@ -647,6 +659,130 @@ test("bridge falls back to a file mention for non-text documents", async () => {
     name: "archive.zip",
     path: String(input[1]!.path),
   });
+});
+
+test("/download sends a regular workspace file as a Telegram document", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-file-"));
+  await fs.mkdir(path.join(workspace, "artifacts"));
+  const filePath = path.join(workspace, "artifacts", "report.txt");
+  await fs.writeFile(filePath, "hello", "utf8");
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig({ workspaceCwd: workspace }),
+    "/tmp/config.json",
+    "/tmp/state.json",
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: testState(),
+    },
+  );
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/download artifacts/report.txt"));
+
+  assert.equal(telegram.sentDocuments.length, 1);
+  assert.equal(telegram.sentDocuments[0]!.chatId, 42);
+  assert.equal(telegram.sentDocuments[0]!.filePath, filePath);
+  assert.match(telegram.sentDocuments[0]!.caption ?? "", /artifacts\/report\.txt/);
+  assert.equal(telegram.sentMessages.length, 0);
+});
+
+test("/download photo sends an image through Telegram photo upload", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-photo-"));
+  const filePath = path.join(workspace, "image.png");
+  await fs.writeFile(filePath, Buffer.from([137, 80, 78, 71]));
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig({ workspaceCwd: workspace }),
+    "/tmp/config.json",
+    "/tmp/state.json",
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: testState(),
+    },
+  );
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/download photo image.png"));
+
+  assert.equal(telegram.sentPhotos.length, 1);
+  assert.equal(telegram.sentPhotos[0]!.filePath, filePath);
+  assert.equal(telegram.sentDocuments.length, 0);
+});
+
+test("/download auto sends an image through Telegram photo upload", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-auto-photo-"));
+  const filePath = path.join(workspace, "image.png");
+  await fs.writeFile(filePath, Buffer.from([137, 80, 78, 71]));
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig({ workspaceCwd: workspace }),
+    "/tmp/config.json",
+    "/tmp/state.json",
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: testState(),
+    },
+  );
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/download image.png"));
+
+  assert.equal(telegram.sentPhotos.length, 1);
+  assert.equal(telegram.sentPhotos[0]!.filePath, filePath);
+  assert.equal(telegram.sentDocuments.length, 0);
+});
+
+test("/download auto zips a directory before sending it", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-auto-zip-"));
+  const directory = path.join(workspace, "artifacts");
+  await fs.mkdir(directory);
+  await fs.writeFile(path.join(directory, "report.txt"), "hello", "utf8");
+  const telegram = new FakeTelegram();
+  const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
+  const bridge = new CodexAnywhereBridge(
+    testConfig({ workspaceCwd: workspace }),
+    "/tmp/config.json",
+    "/tmp/state.json",
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: testState(),
+      execFile: async (file, args, options) => {
+        execCalls.push({ file, args, cwd: options?.cwd });
+        await fs.writeFile(args[2]!, "zip", "utf8");
+        return { stdout: "", stderr: "" };
+      },
+    },
+  );
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/download artifacts"));
+
+  assert.equal(execCalls[0]!.file, "zip");
+  assert.equal(execCalls[0]!.cwd, directory);
+  assert.equal(telegram.sentDocuments.length, 1);
+  assert.match(telegram.sentDocuments[0]!.filePath, /artifacts\.zip$/);
+});
+
+test("/download rejects paths outside the workspace", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-safe-"));
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig({ workspaceCwd: workspace }),
+    "/tmp/config.json",
+    "/tmp/state.json",
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: testState(),
+    },
+  );
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/download ../secret.txt"));
+
+  assert.equal(telegram.sentDocuments.length, 0);
+  assert.equal(telegram.sentPhotos.length, 0);
+  assert.match(telegram.sentMessages[0]!.text, /must stay inside/);
 });
 
 test("bridge edits the active turn control card instead of duplicating it", async () => {

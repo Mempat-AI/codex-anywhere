@@ -1,5 +1,8 @@
-import type { JsonObject, TelegramBotCommand, TelegramUpdate } from "./types.js";
+import fs from "node:fs/promises";
+import path from "node:path";
+
 import type { TelegramParseMode } from "./telegramFormatting.js";
+import type { JsonObject, TelegramBotCommand, TelegramUpdate } from "./types.js";
 
 export class TelegramBotApi {
   readonly #baseUrl: string;
@@ -67,6 +70,18 @@ export class TelegramBotApi {
     return (await this.#request("sendMessage", payload)) as { message_id: number };
   }
 
+  async sendDocument(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
+    return (await this.#uploadFile("sendDocument", chatId, "document", filePath, caption)) as {
+      message_id: number;
+    };
+  }
+
+  async sendPhoto(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
+    return (await this.#uploadFile("sendPhoto", chatId, "photo", filePath, caption)) as {
+      message_id: number;
+    };
+  }
+
   async editMessageText(
     chatId: number,
     messageId: number,
@@ -117,6 +132,36 @@ export class TelegramBotApi {
         "content-type": "application/json",
       },
       body: JSON.stringify(payload),
+    });
+    const body = (await response.json()) as {
+      ok: boolean;
+      description?: string;
+      result?: unknown;
+    };
+    if (!response.ok || !body.ok) {
+      throw new Error(body.description ?? `Telegram request failed for ${method}`);
+    }
+    return body.result;
+  }
+
+  async #uploadFile(
+    method: "sendDocument" | "sendPhoto",
+    chatId: number,
+    fieldName: "document" | "photo",
+    filePath: string,
+    caption?: string,
+  ): Promise<unknown> {
+    const bytes = await fs.readFile(filePath);
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (caption) {
+      form.append("caption", caption);
+    }
+    form.append(fieldName, new Blob([bytes]), path.basename(filePath));
+
+    const response = await fetch(`${this.#baseUrl}/${method}`, {
+      method: "POST",
+      body: form,
     });
     const body = (await response.json()) as {
       ok: boolean;
