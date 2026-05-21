@@ -764,7 +764,30 @@ test("/download auto zips a directory before sending it", async () => {
   assert.match(telegram.sentDocuments[0]!.filePath, /artifacts\.zip$/);
 });
 
-test("/download rejects paths outside the workspace", async () => {
+test("/download allows files under the system temp directory", async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-workspace-"));
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-tmp-"));
+  const filePath = path.join(tempDir, "artifact.txt");
+  await fs.writeFile(filePath, "hello", "utf8");
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig({ workspaceCwd: workspace }),
+    "/tmp/config.json",
+    "/tmp/state.json",
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: testState(),
+    },
+  );
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate(`/download ${filePath}`));
+
+  assert.equal(telegram.sentDocuments.length, 1);
+  assert.equal(telegram.sentDocuments[0]!.filePath, filePath);
+});
+
+test("/download rejects paths outside the workspace and temp directory", async () => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-safe-"));
   const telegram = new FakeTelegram();
   const bridge = new CodexAnywhereBridge(
@@ -778,7 +801,7 @@ test("/download rejects paths outside the workspace", async () => {
     },
   );
 
-  await bridge.handleUpdateForTest(telegramMessageUpdate("/download ../secret.txt"));
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/download /etc/hosts"));
 
   assert.equal(telegram.sentDocuments.length, 0);
   assert.equal(telegram.sentPhotos.length, 0);

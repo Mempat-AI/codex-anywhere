@@ -4482,12 +4482,16 @@ function stripMatchingQuotes(value: string): string {
 }
 
 function resolveWorkspaceDownloadPath(workspaceCwd: string, requestedPath: string): string | null {
-  const resolvedWorkspace = path.resolve(workspaceCwd);
-  const resolvedPath = path.resolve(resolvedWorkspace, requestedPath || ".");
-  if (resolvedPath !== resolvedWorkspace && !resolvedPath.startsWith(`${resolvedWorkspace}${path.sep}`)) {
-    return null;
-  }
-  return resolvedPath;
+  const resolvedPath = path.resolve(workspaceCwd, requestedPath || ".");
+  const allowedRoots = [
+    path.resolve(workspaceCwd),
+    path.resolve(os.tmpdir()),
+  ];
+  return allowedRoots.some((root) => isPathInsideOrEqual(resolvedPath, root)) ? resolvedPath : null;
+}
+
+function isPathInsideOrEqual(targetPath: string, rootPath: string): boolean {
+  return targetPath === rootPath || targetPath.startsWith(`${rootPath}${path.sep}`);
 }
 
 function downloadUsageText(): string {
