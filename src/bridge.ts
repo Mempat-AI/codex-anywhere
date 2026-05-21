@@ -97,6 +97,9 @@ const execFileAsync = promisify(execFile) as ExecFileRunner;
 const COMPUTER_USE_PLUGIN_NAME = "Computer Use";
 const COMPUTER_USE_PLUGIN_PATH = "plugin://computer-use@openai-bundled";
 const COMPUTER_USE_MENTION_TOKEN = "@computer-use";
+const TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024;
+const TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
+const DOWNLOAD_LIST_LIMIT = 50;
 
 type TelegramClient = Pick<
   TelegramBotApi,
@@ -106,6 +109,8 @@ type TelegramClient = Pick<
   | "downloadFile"
   | "sendChatAction"
   | "sendMessage"
+  | "sendDocument"
+  | "sendPhoto"
   | "editMessageText"
   | "answerCallbackQuery"
   | "deleteMessage"
@@ -376,6 +381,9 @@ export class CodexAnywhereBridge {
         case "addbot":
           await this.#handleAddBotCommand(message.chat.id);
           return;
+        case "download":
+          await this.#handleDownloadCommand(message.chat.id, slashCommand.args);
+          return;
         default:
           if (isRecognizedCodexSlashCommand(slashCommand.name)) {
             await this.#handleCodexSlashCommand(
@@ -506,6 +514,151 @@ export class CodexAnywhereBridge {
     const bytes = await this.#telegram.downloadFile(file.file_path);
     await fs.writeFile(targetPath, bytes);
     return { path: targetPath, name, mimeType: document.mime_type ?? null };
+  }
+
+  async #handleDownloadCommand(chatId: number, args: string): Promise<void> {
+    const parsed = parseDownloadCommandArgs(args);
+    if (!parsed) {
+      await this.#sendText(chatId, downloadUsageText());
+      return;
+    }
+
+    if (parsed.mode === "list") {
+      await this.#sendDownloadList(chatId, parsed.target || ".");
+      return;
+    }
+
+    const resolved = resolveWorkspaceDownloadPath(this.#config.workspaceCwd, parsed.target);
+    if (!resolved) {
+      await this.#sendText(chatId, "Download paths must stay inside the configured workspace.");
+      return;
+    }
+
+    let stat;
+    try {
+      stat = await fs.stat(resolved);
+    } catch (error) {
+      await this.#sendText(chatId, `No file found: ${parsed.target}`);
+      return;
+    }
+
+    if (parsed.mode === "info") {
+      await this.#sendDownloadInfo(chatId, parsed.target, resolved, stat);
+      return;
+    }
+
+    if (parsed.mode === "zip" || (parsed.mode === "auto" && stat.isDirectory())) {
+      await this.#sendDownloadZip(chatId, parsed.target, resolved, stat);
+      return;
+    }
+
+    if (!stat.isFile()) {
+      await this.#sendText(chatId, "That path is not a file. Use /download zip <path> for folders.");
+      return;
+    }
+
+    const uploadMode = parsed.mode === "auto" && isLikelyImagePath(resolved) ? "photo" : parsed.mode;
+    const limit = uploadMode === "photo"
+      ? TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES
+      : TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES;
+    if (stat.size > limit) {
+      await this.#sendText(chatId, `File is too large for Telegram ${uploadMode} upload: ${formatBytes(stat.size)}.`);
+      return;
+    }
+
+    const caption = downloadCaption(parsed.target, stat.size);
+    try {
+      if (uploadMode === "photo") {
+        await this.#telegram.sendPhoto(chatId, resolved, caption);
+      } else {
+        await this.#telegram.sendDocument(chatId, resolved, caption);
+      }
+    } catch (error) {
+      await this.#sendText(chatId, `Telegram upload failed: ${formatErrorMessage(error)}`);
+    }
+  }
+
+  async #sendDownloadList(chatId: number, target: string): Promise<void> {
+    const resolved = resolveWorkspaceDownloadPath(this.#config.workspaceCwd, target);
+    if (!resolved) {
+      await this.#sendText(chatId, "Download paths must stay inside the configured workspace.");
+      return;
+    }
+
+    let entries;
+    try {
+      entries = await fs.readdir(resolved, { withFileTypes: true });
+    } catch (error) {
+      await this.#sendText(chatId, `Could not list: ${target}`);
+      return;
+    }
+
+    const lines = entries
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .slice(0, DOWNLOAD_LIST_LIMIT)
+      .map((entry) => `${entry.isDirectory() ? "/" : " "} ${entry.name}`);
+    const extra = entries.length > DOWNLOAD_LIST_LIMIT
+      ? `\n... ${entries.length - DOWNLOAD_LIST_LIMIT} more`
+      : "";
+    await this.#sendHtmlText(
+      chatId,
+      [
+        `<b>Downloadable files</b>`,
+        `<code>${escapeTelegramHtml(path.relative(this.#config.workspaceCwd, resolved) || ".")}</code>`,
+        "",
+        `<pre>${escapeTelegramHtml(lines.join("\n") || "(empty)")}</pre>${extra}`,
+      ].join("\n"),
+    );
+  }
+
+  async #sendDownloadInfo(
+    chatId: number,
+    requestedPath: string,
+    resolvedPath: string,
+    stat: { isFile(): boolean; isDirectory(): boolean; size: number },
+  ): Promise<void> {
+    const mode = stat.isDirectory() ? "zip" : isLikelyImagePath(resolvedPath) ? "photo or file" : "file";
+    await this.#sendHtmlText(
+      chatId,
+      [
+        "<b>Download info</b>",
+        `Path: <code>${escapeTelegramHtml(requestedPath)}</code>`,
+        `Resolved: <code>${escapeTelegramHtml(path.relative(this.#config.workspaceCwd, resolvedPath) || ".")}</code>`,
+        `Type: <code>${stat.isDirectory() ? "directory" : stat.isFile() ? "file" : "other"}</code>`,
+        `Size: <code>${escapeTelegramHtml(formatBytes(stat.size))}</code>`,
+        `Suggested: <code>/download ${escapeTelegramHtml(mode.split(" ")[0]!)} ${escapeTelegramHtml(requestedPath)}</code>`,
+      ].join("\n"),
+    );
+  }
+
+  async #sendDownloadZip(
+    chatId: number,
+    requestedPath: string,
+    resolvedPath: string,
+    stat: { isFile(): boolean; isDirectory(): boolean; size: number },
+  ): Promise<void> {
+    if (!stat.isFile() && !stat.isDirectory()) {
+      await this.#sendText(chatId, "That path cannot be zipped.");
+      return;
+    }
+
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-download-"));
+    const zipPath = path.join(tempDir, `${sanitizeTelegramFileName(path.basename(resolvedPath) || "download")}.zip`);
+    const cwd = stat.isDirectory() ? resolvedPath : path.dirname(resolvedPath);
+    const zipTarget = stat.isDirectory() ? "." : path.basename(resolvedPath);
+    try {
+      await this.#execFile("zip", ["-r", "-q", zipPath, zipTarget], { cwd });
+      const zipStat = await fs.stat(zipPath);
+      if (zipStat.size > TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES) {
+        await this.#sendText(chatId, `Zip is too large for Telegram upload: ${formatBytes(zipStat.size)}.`);
+        return;
+      }
+      await this.#telegram.sendDocument(chatId, zipPath, downloadCaption(`${requestedPath}.zip`, zipStat.size));
+    } catch (error) {
+      await this.#sendText(chatId, `Zip download failed: ${formatErrorMessage(error)}`);
+    } finally {
+      await fs.rm(tempDir, { recursive: true, force: true });
+    }
   }
 
   async #handleCallbackQuery(callback: TelegramCallbackQuery): Promise<void> {
@@ -4296,6 +4449,91 @@ function sanitizeTelegramFileName(name: string): string {
   return sanitized || "telegram-file";
 }
 
+type DownloadMode = "auto" | "file" | "photo" | "zip" | "list" | "info";
+
+function parseDownloadCommandArgs(args: string): { mode: DownloadMode; target: string } | null {
+  const trimmed = args.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const firstSpace = trimmed.search(/\s/);
+  const first = (firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace)).toLowerCase();
+  const rest = firstSpace === -1 ? "" : trimmed.slice(firstSpace).trim();
+  if (["auto", "file", "photo", "zip", "list", "info"].includes(first)) {
+    if (first === "list") {
+      return { mode: "list", target: stripMatchingQuotes(rest) };
+    }
+    if (!rest) {
+      return null;
+    }
+    return { mode: first as DownloadMode, target: stripMatchingQuotes(rest) };
+  }
+  return { mode: "auto", target: stripMatchingQuotes(trimmed) };
+}
+
+function stripMatchingQuotes(value: string): string {
+  if (
+    (value.startsWith('"') && value.endsWith('"'))
+    || (value.startsWith("'") && value.endsWith("'"))
+  ) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+function resolveWorkspaceDownloadPath(workspaceCwd: string, requestedPath: string): string | null {
+  const resolvedPath = path.resolve(workspaceCwd, requestedPath || ".");
+  const allowedRoots = [
+    path.resolve(workspaceCwd),
+    path.resolve(os.tmpdir()),
+  ];
+  return allowedRoots.some((root) => isPathInsideOrEqual(resolvedPath, root)) ? resolvedPath : null;
+}
+
+function isPathInsideOrEqual(targetPath: string, rootPath: string): boolean {
+  return targetPath === rootPath || targetPath.startsWith(`${rootPath}${path.sep}`);
+}
+
+function downloadUsageText(): string {
+  return [
+    "Usage:",
+    "/download <path>",
+    "/download auto <path>",
+    "/download file <path>",
+    "/download photo <image-path>",
+    "/download zip <path>",
+    "/download list [path]",
+    "/download info <path>",
+  ].join("\n");
+}
+
+function downloadCaption(requestedPath: string, size: number): string {
+  return `${requestedPath} (${formatBytes(size)})`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  for (const unit of units) {
+    if (value < 1024 || unit === units[units.length - 1]) {
+      return `${value.toFixed(value >= 10 ? 1 : 2)} ${unit}`;
+    }
+    value /= 1024;
+  }
+  return `${bytes} B`;
+}
+
+function isLikelyImagePath(filePath: string): boolean {
+  return [".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(path.extname(filePath).toLowerCase());
+}
+
+function formatErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 async function readTelegramDocumentText(
   filePath: string,
   fileName: string,
@@ -4425,6 +4663,7 @@ function telegramCommands(): TelegramBotCommand[] {
     { command: "cancel", description: "cancel the active interactive prompt" },
     { command: "workspace", description: "show or change the bot workspace" },
     { command: "addbot", description: "add and start another Telegram bot" },
+    { command: "download", description: "send workspace files to Telegram" },
     { command: "omx", description: "run supported oh-my-codex CLI commands" },
     { command: "computer", description: "run a Computer Use task" },
     { command: "model", description: "show or set the active model" },
