@@ -149,14 +149,6 @@ export function normalizeSandboxMode(value: string): SandboxMode | null {
   return SANDBOX_MODE_ALIASES.get(value.trim().toLowerCase()) ?? null;
 }
 
-export function normalizeReasoningEffort(value: string): string | null {
-  const normalized = value.trim().toLowerCase();
-  if (["minimal", "low", "medium", "high"].includes(normalized)) {
-    return normalized;
-  }
-  return null;
-}
-
 export function codexSlashHelpText(): string {
   return [
     "Codex Anywhere commands:",

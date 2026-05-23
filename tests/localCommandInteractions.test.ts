@@ -46,9 +46,40 @@ test("buildModelInteractiveSession includes reset and available models", () => {
 test("buildLocalInteractiveFollowUpSteps adds model effort step", () => {
   assert.deepEqual(buildLocalInteractiveFollowUpSteps("model", { model: "__reset__" }), []);
   assert.equal(
-    buildLocalInteractiveFollowUpSteps("model", { model: "gpt-5.4" })[0]?.key,
+    buildLocalInteractiveFollowUpSteps("model", { model: "gpt-5.4" }, {
+      models: [
+        {
+          model: "gpt-5.4",
+          supportedReasoningEfforts: [
+            { reasoningEffort: "low" },
+            { reasoningEffort: "xhigh" },
+          ],
+        },
+      ],
+    })[0]?.key,
     "reasoningEffort",
   );
+});
+
+test("buildLocalInteractiveFollowUpSteps uses model-advertised effort options", () => {
+  const step = buildLocalInteractiveFollowUpSteps("model", { model: "gpt-5.4" }, {
+    models: [
+      {
+        model: "gpt-5.4",
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low", description: "Fast" },
+          { reasoningEffort: "xhigh", description: "Deep" },
+        ],
+      },
+    ],
+  })[0];
+
+  assert.deepEqual(step?.options?.map((option) => option.value), [
+    "__default__",
+    "low",
+    "xhigh",
+  ]);
+  assert.match(step?.options?.[2]?.label ?? "", /X-High/);
 });
 
 test("buildExperimentalInteractiveSession builds feature choices", () => {

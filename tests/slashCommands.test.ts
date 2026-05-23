@@ -5,7 +5,6 @@ import {
   codexSlashHelpText,
   isRecognizedCodexSlashCommand,
   normalizeApprovalPolicy,
-  normalizeReasoningEffort,
   normalizeSandboxMode,
   parseTelegramSlashCommand,
 } from "../src/slashCommands.js";
@@ -42,12 +41,6 @@ test("normalizeSandboxMode accepts common aliases", () => {
   assert.equal(normalizeSandboxMode("workspace_write"), "workspace-write");
   assert.equal(normalizeSandboxMode("danger"), "danger-full-access");
   assert.equal(normalizeSandboxMode("bad"), null);
-});
-
-test("normalizeReasoningEffort only accepts supported values", () => {
-  assert.equal(normalizeReasoningEffort("high"), "high");
-  assert.equal(normalizeReasoningEffort("minimal"), "minimal");
-  assert.equal(normalizeReasoningEffort("extreme"), null);
 });
 
 test("codexSlashHelpText mentions /omx bridge support", () => {

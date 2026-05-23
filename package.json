@@ -1,7 +1,7 @@
 {
   "name": "codex-anywhere",
   "private": false,
-  "version": "0.3.12",
+  "version": "0.3.13",
   "description": "Telegram-native Codex client for background use anywhere",
   "license": "Apache-2.0",
   "type": "module",

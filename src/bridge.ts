@@ -38,6 +38,13 @@ import {
   buildReviewInteractiveSession,
   buildVerboseInteractiveSession,
 } from "./localCommandInteractions.js";
+import {
+  findModelEntry,
+  modelName,
+  modelReasoningEfforts,
+  normalizeReasoningEffortValue,
+  reasoningEffortUsageForModel,
+} from "./modelCapabilities.js";
 import { loadState, saveConfig, saveState } from "./persistence.js";
 import type { SessionOwnershipRegistry } from "./sessionOwnership.js";
 import { formatSessionCallbackData, parseSessionCallbackData } from "./sessions.js";
@@ -48,7 +55,6 @@ import {
   isTaskBlockingSlashCommand,
   isUnsupportedTelegramOnlyCodexCommand,
   normalizeApprovalPolicy,
-  normalizeReasoningEffort,
   normalizeSandboxMode,
   parseTelegramSlashCommand,
 } from "./slashCommands.js";
@@ -1172,6 +1178,7 @@ export class CodexAnywhereBridge {
     const steps = buildLocalInteractiveFollowUpSteps(
       command as "model" | "fast" | "permissions" | "sandbox" | "experimental" | "rename" | "review",
       session.answers,
+      meta,
     );
     if (steps.length === 0) {
       return;
@@ -1509,7 +1516,7 @@ export class CodexAnywhereBridge {
           .filter((line): line is string => Boolean(line))
           .slice(0, 20),
         "",
-        "Usage: /model <model> [minimal|low|medium|high]",
+        "Usage: /model <model> [supported-effort]",
         "Usage: /model reset",
       ];
       await this.#sendText(chatId, lines.join("\n"));
@@ -1526,17 +1533,21 @@ export class CodexAnywhereBridge {
 
     const parts = trimmed.split(/\s+/).filter(Boolean);
     const model = parts[0] ?? "";
-    const effort = parts[1] ? normalizeReasoningEffort(parts[1]) : null;
-    const knownModel = models.find(
-      (entry) => entry && typeof entry === "object" && asString((entry as JsonObject).model) === model,
-    );
+    const knownModel = findModelEntry(models, model);
     if (!knownModel) {
       await this.#sendText(chatId, `Unknown model: ${model}\nRun /model to list available models.`);
       return;
     }
-    if (parts[1] && !effort) {
-      await this.#sendText(chatId, "Usage: /model <model> [minimal|low|medium|high]");
-      return;
+    const effort = parts[1] ? normalizeReasoningEffortValue(parts[1]) : null;
+    if (parts[1]) {
+      const supportedEfforts = modelReasoningEfforts(knownModel);
+      if (!effort || !supportedEfforts?.some((entry) => entry.value === effort)) {
+        await this.#sendText(
+          chatId,
+          `Unsupported reasoning effort for ${model}: ${parts[1]}\nSupported: ${reasoningEffortUsageForModel(knownModel)}`,
+        );
+        return;
+      }
     }
 
     state.model = model;
@@ -3403,7 +3414,7 @@ export class CodexAnywhereBridge {
     const effortValue = asString(answers.reasoningEffort);
     const effort =
       effortValue && effortValue !== "__default__"
-        ? normalizeReasoningEffort(effortValue)
+        ? normalizeReasoningEffortValue(effortValue)
         : null;
 
     state.model = model;
@@ -4264,13 +4275,13 @@ function formatModelSummary(entry: unknown): string | null {
   if (!entry || typeof entry !== "object") {
     return null;
   }
-  const model = asString((entry as JsonObject).model);
+  const model = modelName(entry);
   if (!model) {
     return null;
   }
   const displayName = asString((entry as JsonObject).displayName) ?? model;
   const isDefault = (entry as JsonObject).isDefault === true ? " default" : "";
-  return `- ${model}${isDefault}: ${displayName}`;
+  return `- ${model}${isDefault}: ${displayName}; efforts=${reasoningEffortUsageForModel(entry)}`;
 }
 
 function formatRateLimitSnapshot(snapshot: JsonObject | undefined): string {
