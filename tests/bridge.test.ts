@@ -1465,7 +1465,7 @@ test("/version reports the installed package version", async () => {
   assert.match(telegram.sentMessages[0]!.text, /^codex-anywhere \d+\.\d+\.\d+/);
 });
 
-test("/upgrade installs latest package and schedules a detached official service relaunch", async () => {
+test("/upgrade installs latest package and schedules a detached official service restart", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
@@ -1491,16 +1491,20 @@ test("/upgrade installs latest package and schedules a detached official service
   assert.equal(execCalls.length, 2);
   assert.equal(execCalls[1]!.file, "sh");
   assert.deepEqual(execCalls[1]!.args.slice(0, 1), ["-c"]);
-  assert.match(execCalls[1]!.args[1]!, /nohup sh -c 'sleep 3; for attempt in 1 2 3 4 5/);
+  assert.match(execCalls[1]!.args[1]!, /nohup sh -c 'sleep 3\nfor attempt in 1 2 3 4 5/);
+  assert.match(execCalls[1]!.args[1]!, /codex-anywhere restart-service attempt/);
+  assert.match(execCalls[1]!.args[1]!, /codex-anywhere restart-service succeeded/);
   assert.match(execCalls[1]!.args[1]!, /codex-anywhere install-service attempt/);
   assert.match(execCalls[1]!.args[1]!, /codex-anywhere install-service succeeded/);
   assert.match(execCalls[1]!.args[1]!, /codex-anywhere-upgrade-install-service\.log/);
+  assert.doesNotMatch(execCalls[1]!.args[1]!, /do;/);
+  assert.doesNotMatch(execCalls[1]!.args[1]!, /then;/);
   assert.equal(execCalls[1]!.cwd, testConfig().workspaceCwd);
   assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
-  assert.match(telegram.sentMessages[1]!.text, /detached service relaunch/);
+  assert.match(telegram.sentMessages[1]!.text, /detached service restart/);
 });
 
 test("/upgrade rejects arguments", async () => {

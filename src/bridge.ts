@@ -3112,7 +3112,7 @@ export class CodexAnywhereBridge {
     const startLines = [
       "<b>Upgrade started</b>",
       "Installing <code>codex-anywhere@latest</code> with npm.",
-      "If installation succeeds, the background service will be reinstalled from the official package and restarted.",
+      "If installation succeeds, the background service will be restarted from the official package.",
     ];
     await this.#sendHtmlText(
       chatId,
@@ -3136,10 +3136,10 @@ export class CodexAnywhereBridge {
         [
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
-          "Scheduling a detached service relaunch from the official package now. Send /version after a few seconds to confirm.",
+          "Scheduling a detached service restart from the official package now. Send /version after a few seconds to confirm.",
         ].join("\n"),
       );
-      await this.#execFile("sh", ["-c", buildDetachedServiceInstallCommand()], {
+      await this.#execFile("sh", ["-c", buildDetachedServiceRestartCommand()], {
         cwd: this.#config.workspaceCwd,
         env: process.env,
         timeout: 10_000,
@@ -4715,11 +4715,17 @@ function summarizeUpgradeOutput(stdout: string, stderr: string): string {
   return lines.slice(-6).join("\n") || "npm install completed";
 }
 
-function buildDetachedServiceInstallCommand(): string {
+function buildDetachedServiceRestartCommand(): string {
   const logPath = path.join(os.tmpdir(), "codex-anywhere-upgrade-install-service.log");
   const script = [
     "sleep 3",
     "for attempt in 1 2 3 4 5; do",
+    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service attempt ${attempt}\"",
+    "  if codex-anywhere restart-service; then",
+    "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service succeeded\"",
+    "    exit 0",
+    "  fi",
+    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service failed\"",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service attempt ${attempt}\"",
     "  if codex-anywhere install-service; then",
     "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service succeeded\"",
@@ -4729,7 +4735,7 @@ function buildDetachedServiceInstallCommand(): string {
     "  sleep 3",
     "done",
     "exit 1",
-  ].join("; ");
+  ].join("\n");
   return `nohup sh -c ${shellQuote(script)} >${shellQuote(logPath)} 2>&1 &`;
 }
 
