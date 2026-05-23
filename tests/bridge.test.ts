@@ -911,6 +911,69 @@ test("/status renders a compact HTML status card", async () => {
   assert.match(telegram.sentMessages[0]!.text, /<b>Rate limits<\/b>\n75% remaining/);
 });
 
+test("/model accepts reasoning efforts advertised by Codex", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "model/list") {
+      return {
+        data: [
+          {
+            model: "gpt-5.4",
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low" },
+              { reasoningEffort: "xhigh" },
+            ],
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/model gpt-5.4 xhigh"));
+
+  assert.match(telegram.sentMessages[0]!.text, /Model override set to gpt-5\.4 \(xhigh\)/);
+});
+
+test("/model rejects reasoning efforts not advertised by Codex", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "model/list") {
+      return {
+        data: [
+          {
+            model: "gpt-5.4",
+            supportedReasoningEfforts: [
+              { reasoningEffort: "low" },
+              { reasoningEffort: "medium" },
+            ],
+          },
+        ],
+      };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/model gpt-5.4 xhigh"));
+
+  assert.match(telegram.sentMessages[0]!.text, /Unsupported reasoning effort/);
+  assert.match(telegram.sentMessages[0]!.text, /Supported: low\|medium/);
+});
+
 test("/reload requires an existing current thread", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();

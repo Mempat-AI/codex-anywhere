@@ -4,6 +4,12 @@ import type {
   JsonObject,
   PendingInteractiveSessionStep,
 } from "./types.js";
+import {
+  findModelEntry,
+  formatReasoningEffortLabel,
+  modelName,
+  modelReasoningEfforts,
+} from "./modelCapabilities.js";
 
 export type LocalInteractiveCommand =
   | "addbot"
@@ -72,7 +78,7 @@ export function buildModelInteractiveSession(
       if (!entry || typeof entry !== "object") {
         return null;
       }
-      const model = asString((entry as JsonObject).model);
+      const model = modelName(entry);
       if (!model) {
         return null;
       }
@@ -106,7 +112,7 @@ export function buildModelInteractiveSession(
         required: true,
       },
     ],
-    meta: { command: "model", followUpAdded: false },
+    meta: { command: "model", followUpAdded: false, models },
   };
 }
 
@@ -450,12 +456,26 @@ export function buildReviewInteractiveSession(): LocalInteractiveSessionSpec {
 export function buildLocalInteractiveFollowUpSteps(
   command: LocalInteractiveCommand,
   answers: Record<string, unknown>,
+  context: JsonObject = {},
 ): PendingInteractiveSessionStep[] {
   switch (command) {
     case "model": {
       const selectedModel = asString(answers.model);
       if (!selectedModel || selectedModel === "__reset__") {
         return [];
+      }
+      const modelEntry = findModelEntry(Array.isArray(context.models) ? context.models : [], selectedModel);
+      const supportedEfforts = modelReasoningEfforts(modelEntry);
+      if (!supportedEfforts) {
+        return [
+          {
+            key: "reasoningEffort",
+            prompt: "Codex did not advertise reasoning-effort options for this model.",
+            kind: "choice",
+            options: [{ label: "Default", value: "__default__" }],
+            required: true,
+          },
+        ];
       }
       return [
         {
@@ -464,10 +484,10 @@ export function buildLocalInteractiveFollowUpSteps(
           kind: "choice",
           options: [
             { label: "Default", value: "__default__" },
-            { label: "Minimal", value: "minimal" },
-            { label: "Low", value: "low" },
-            { label: "Medium", value: "medium" },
-            { label: "High", value: "high" },
+            ...supportedEfforts.map((effort) => ({
+              label: formatReasoningEffortLabel(effort.value),
+              value: effort.value,
+            })),
           ],
           required: true,
         },
