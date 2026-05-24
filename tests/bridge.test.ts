@@ -1580,7 +1580,16 @@ test("/upgrade installs latest package and schedules a detached official service
     initialState: testState(),
     execFile: async (file, args, options) => {
       execCalls.push({ file, args, cwd: options?.cwd });
-      return { stdout: file === "npm" ? "changed 1 package\n" : "restarted\n", stderr: "" };
+      if (file === "npm" && args.join(" ") === "install -g codex-anywhere@latest") {
+        return { stdout: "changed 1 package\n", stderr: "" };
+      }
+      if (file === "npm" && args.join(" ") === "root -g") {
+        return { stdout: "/opt/homebrew/lib/node_modules\n", stderr: "" };
+      }
+      if (file === process.execPath) {
+        return { stdout: "codex-anywhere 0.3.15\n", stderr: "" };
+      }
+      return { stdout: "restarted\n", stderr: "" };
     },
   });
 
@@ -1593,23 +1602,69 @@ test("/upgrade installs latest package and schedules a detached official service
       cwd: testConfig().workspaceCwd,
     },
   ]);
-  assert.equal(execCalls.length, 2);
-  assert.equal(execCalls[1]!.file, "sh");
-  assert.deepEqual(execCalls[1]!.args.slice(0, 1), ["-c"]);
-  assert.match(execCalls[1]!.args[1]!, /nohup sh -c 'sleep 3\nfor attempt in 1 2 3 4 5/);
-  assert.match(execCalls[1]!.args[1]!, /codex-anywhere restart-service attempt/);
-  assert.match(execCalls[1]!.args[1]!, /codex-anywhere restart-service succeeded/);
-  assert.match(execCalls[1]!.args[1]!, /codex-anywhere install-service attempt/);
-  assert.match(execCalls[1]!.args[1]!, /codex-anywhere install-service succeeded/);
-  assert.match(execCalls[1]!.args[1]!, /codex-anywhere-upgrade-install-service\.log/);
-  assert.doesNotMatch(execCalls[1]!.args[1]!, /do;/);
-  assert.doesNotMatch(execCalls[1]!.args[1]!, /then;/);
-  assert.equal(execCalls[1]!.cwd, testConfig().workspaceCwd);
+  assert.deepEqual(execCalls[1], {
+    file: "npm",
+    args: ["root", "-g"],
+    cwd: testConfig().workspaceCwd,
+  });
+  assert.deepEqual(execCalls[2], {
+    file: process.execPath,
+    args: ["/opt/homebrew/lib/node_modules/codex-anywhere/dist/cli.js", "--version"],
+    cwd: testConfig().workspaceCwd,
+  });
+  assert.equal(execCalls.length, 4);
+  assert.equal(execCalls[3]!.file, "sh");
+  assert.deepEqual(execCalls[3]!.args.slice(0, 1), ["-c"]);
+  const restartCommand = execCalls[3]!.args[1]!;
+  assert.match(restartCommand, /mkdir -p '\/tmp\/logs' && nohup sh -c 'sleep 3\nexport CODEX_ANYWHERE_HOME=/);
+  assert.match(restartCommand, /codex-anywhere\/dist\/cli\.js/);
+  assert.match(restartCommand, /codex-anywhere restart-service attempt/);
+  assert.match(restartCommand, /codex-anywhere restart-service succeeded/);
+  assert.match(restartCommand, /codex-anywhere install-service attempt/);
+  assert.match(restartCommand, /codex-anywhere install-service succeeded/);
+  assert.match(restartCommand, /upgrade-restart\.log/);
+  assert.doesNotMatch(restartCommand, /\n  if codex-anywhere restart-service/);
+  assert.doesNotMatch(restartCommand, /do;/);
+  assert.doesNotMatch(restartCommand, /then;/);
+  assert.equal(execCalls[3]!.cwd, testConfig().workspaceCwd);
   assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
+  assert.match(telegram.sentMessages[1]!.text, /codex-anywhere 0\.3\.15/);
   assert.match(telegram.sentMessages[1]!.text, /detached service restart/);
+});
+
+test("/upgrade reports installed CLI verification failures", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const execCalls: string[] = [];
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+    execFile: async (file, args) => {
+      execCalls.push(`${file} ${args.join(" ")}`);
+      if (file === "npm" && args.join(" ") === "install -g codex-anywhere@latest") {
+        return { stdout: "changed 1 package\n", stderr: "" };
+      }
+      if (file === "npm" && args.join(" ") === "root -g") {
+        return { stdout: "/opt/homebrew/lib/node_modules\n", stderr: "" };
+      }
+      return { stdout: "unexpected tool output\n", stderr: "" };
+    },
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/upgrade"));
+
+  assert.deepEqual(execCalls, [
+    "npm install -g codex-anywhere@latest",
+    "npm root -g",
+    `${process.execPath} /opt/homebrew/lib/node_modules/codex-anywhere/dist/cli.js --version`,
+  ]);
+  assert.equal(telegram.sentMessages.length, 2);
+  assert.match(telegram.sentMessages[1]!.text, /Upgrade failed/);
+  assert.match(telegram.sentMessages[1]!.text, /did not report a valid version/);
 });
 
 test("/upgrade rejects arguments", async () => {
