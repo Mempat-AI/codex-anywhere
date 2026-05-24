@@ -56,6 +56,7 @@ export class TelegramBotApi {
     text: string,
     replyMarkup?: JsonObject,
     parseMode?: TelegramParseMode,
+    replyToMessageId?: number | null,
   ): Promise<{ message_id: number }> {
     const payload: JsonObject = {
       chat_id: chatId,
@@ -66,6 +67,11 @@ export class TelegramBotApi {
     }
     if (parseMode) {
       payload.parse_mode = parseMode;
+    }
+    if (replyToMessageId !== null && replyToMessageId !== undefined) {
+      payload.reply_parameters = {
+        message_id: replyToMessageId,
+      };
     }
     return (await this.#request("sendMessage", payload)) as { message_id: number };
   }

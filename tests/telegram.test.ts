@@ -6,6 +6,34 @@ import test from "node:test";
 
 import { TelegramBotApi } from "../src/telegram.js";
 
+test("sendMessage can reply to the source Telegram message", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedPayload: Record<string, unknown> | null = null;
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    requestedPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({ ok: true, result: { message_id: 9 } });
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    const result = await api.sendMessage(42, "working", undefined, "HTML", 123);
+
+    assert.equal(result.message_id, 9);
+    assert.equal(requestedUrl, "https://api.telegram.org/bottoken/sendMessage");
+    assert.deepEqual(requestedPayload, {
+      chat_id: 42,
+      text: "working",
+      parse_mode: "HTML",
+      reply_parameters: {
+        message_id: 123,
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("sendDocument uploads a local file with Telegram multipart form-data", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-telegram-upload-"));
   const filePath = path.join(tempDir, "report.txt");

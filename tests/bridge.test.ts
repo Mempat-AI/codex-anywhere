@@ -18,7 +18,13 @@ import type {
 } from "../src/types.js";
 
 class FakeTelegram {
-  readonly sentMessages: Array<{ chatId: number; text: string; replyMarkup?: JsonObject; parseMode?: string }> = [];
+  readonly sentMessages: Array<{
+    chatId: number;
+    text: string;
+    replyMarkup?: JsonObject;
+    parseMode?: string;
+    replyToMessageId?: number | null;
+  }> = [];
   readonly sentDocuments: Array<{ chatId: number; filePath: string; caption?: string }> = [];
   readonly sentPhotos: Array<{ chatId: number; filePath: string; caption?: string }> = [];
   readonly editedMessages: Array<{
@@ -51,8 +57,9 @@ class FakeTelegram {
     text: string,
     replyMarkup?: JsonObject,
     parseMode?: string,
+    replyToMessageId?: number | null,
   ): Promise<{ message_id: number }> {
-    this.sentMessages.push({ chatId, text, replyMarkup, parseMode });
+    this.sentMessages.push({ chatId, text, replyMarkup, parseMode, replyToMessageId });
     return { message_id: this.sentMessages.length };
   }
 
@@ -314,7 +321,7 @@ test("bridge maps skill-first OMX workflows back into the current thread", async
   ]);
 });
 
-test("final agent message chunks are not sent twice when the turn completes", async () => {
+test("final agent message chunks are sent from the turn card only once", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
@@ -337,8 +344,12 @@ test("final agent message chunks are not sent twice when the turn completes", as
     },
   });
 
-  const messagesAfterItem = telegram.sentMessages.length;
-  assert.equal(messagesAfterItem, 3);
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
+  assert.match(telegram.sentMessages[0]!.text, /Run details/);
+  assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.equal(telegram.editedMessages.length, 1);
+  assert.equal(telegram.editedMessages[0]!.messageId, 1);
 
   await bridge.handleNotificationForTest("turn/completed", {
     threadId: "thread-1",
@@ -348,7 +359,101 @@ test("final agent message chunks are not sent twice when the turn completes", as
     },
   });
 
-  assert.equal(telegram.sentMessages.length, messagesAfterItem);
+  assert.equal(telegram.sentMessages.length, 3);
+  assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[2]!.replyToMessageId, 1);
+  assert.equal(telegram.editedMessages.length, 2);
+  assert.equal(telegram.editedMessages[1]!.messageId, 1);
+});
+
+test("turn card combines live output and run details in one reply card", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("optimize Telegram UX"));
+  await bridge.handleNotificationForTest("item/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "preamble-1",
+      type: "agentMessage",
+      phase: "commentary",
+    },
+  });
+  await bridge.handleNotificationForTest("item/agentMessage/delta", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId: "preamble-1",
+    delta: "I will inspect the Telegram bridge.",
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "preamble-1",
+      type: "agentMessage",
+      text: "I will inspect the Telegram bridge.",
+      phase: "commentary",
+    },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "cmd-1",
+      type: "commandExecution",
+      command: "pnpm test",
+      status: "completed",
+      exitCode: 0,
+    },
+  });
+  const afterToolEdit = telegram.editedMessages.at(-1)!;
+  assert.equal(afterToolEdit.messageId, 1);
+  assert.match(afterToolEdit.text, /^Tool: Command completed, exit 0: pnpm test/);
+  assert.match(afterToolEdit.text, /<blockquote expandable>/);
+  assert.match(afterToolEdit.text, /Run details/);
+  assert.match(afterToolEdit.text, /Preamble:/);
+  assert.match(afterToolEdit.text, /Tool:/);
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Done.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+    },
+  });
+
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
+  assert.match(telegram.sentMessages[0]!.text, /<blockquote expandable>/);
+  assert.match(telegram.sentMessages[0]!.text, /Run details/);
+  assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.ok(telegram.editedMessages.length >= 1);
+  const finalEdit = telegram.editedMessages.at(-1)!;
+  assert.equal(finalEdit.messageId, 1);
+  assert.match(finalEdit.text, /^Done\./);
+  assert.match(finalEdit.text, /<blockquote expandable>/);
+  assert.match(finalEdit.text, /Run details/);
+  assert.match(finalEdit.text, /Preamble:/);
+  assert.match(finalEdit.text, /Tool:/);
+  assert.match(finalEdit.text, /pnpm test/);
+  assert.doesNotMatch(finalEdit.text, /Working on:/);
+  assert.doesNotMatch(finalEdit.text, /Current:/);
 });
 
 test("bridge routes /computer through the Computer Use plugin mention", async () => {

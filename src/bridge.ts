@@ -64,8 +64,6 @@ import {
   escapeTelegramHtml,
   formatApprovalPromptHtml,
   formatApprovalResolutionHtml,
-  formatCommandCompletionHtml,
-  formatFileChangeCompletionHtml,
   formatPendingInputActionHtml,
   formatThreadGoalHtml,
   formatTurnCompletionHtml,
@@ -127,6 +125,29 @@ type CodexClient = Pick<
   "start" | "initialize" | "call" | "notify" | "respond" | "nextMessage" | "close"
 >;
 
+interface PendingTurnOrigin {
+  originMessageId: number | null;
+}
+
+interface TurnTraceEntry {
+  label: string;
+  text: string;
+}
+
+interface TurnCard {
+  threadId: string;
+  turnId: string;
+  chatId: number;
+  messageId: number | null;
+  originMessageId: number | null;
+  currentStatus: string;
+  finalText: string | null;
+  trace: TurnTraceEntry[];
+  lastEditAt: number;
+  finalized: boolean;
+  overflowSent: boolean;
+}
+
 export interface CodexAnywhereBridgeDeps {
   telegram?: TelegramClient;
   codex?: CodexClient;
@@ -159,6 +180,9 @@ export class CodexAnywhereBridge {
   readonly #pendingAccountLogins = new Map<string, number>();
   readonly #items = new Map<string, JsonObject>();
   readonly #streams = new Map<string, StreamBuffer>();
+  readonly #pendingChatOrigins = new Map<number, PendingTurnOrigin>();
+  readonly #pendingTurnOrigins = new Map<string, PendingTurnOrigin>();
+  readonly #turnCards = new Map<string, TurnCard>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
   readonly #hasInitialState: boolean;
   #initialized = false;
@@ -327,7 +351,7 @@ export class CodexAnywhereBridge {
 
     const explicitOmxTeam = parseExplicitOmxTeamInvocation(text);
     if (explicitOmxTeam) {
-      await this.#handleOmxCommand(message.chat.id, explicitOmxTeam);
+      await this.#handleOmxCommand(message.chat.id, explicitOmxTeam, message.message_id);
       return;
     }
 
@@ -376,10 +400,10 @@ export class CodexAnywhereBridge {
           await this.#upgradeSelf(message.chat.id, slashCommand.args);
           return;
         case "omx":
-          await this.#handleOmxCommand(message.chat.id, slashCommand.args);
+          await this.#handleOmxCommand(message.chat.id, slashCommand.args, message.message_id);
           return;
         case "computer":
-          await this.#handleComputerCommand(message.chat.id, slashCommand.args);
+          await this.#handleComputerCommand(message.chat.id, slashCommand.args, message.message_id);
           return;
         case "workspace":
           await this.#handleWorkspaceCommand(message.chat.id, slashCommand.args);
@@ -407,7 +431,7 @@ export class CodexAnywhereBridge {
       }
     }
 
-    await this.#submitChatInput(message.chat.id, [{ type: "text", text }]);
+    await this.#submitChatInput(message.chat.id, [{ type: "text", text }], message.message_id);
   }
 
   async #handleImageMessage(message: TelegramMessage, caption: string): Promise<void> {
@@ -422,7 +446,7 @@ export class CodexAnywhereBridge {
       input.push({ type: "text", text: caption });
     }
     input.push({ type: "localImage", path: imagePath });
-    await this.#submitChatInput(message.chat.id, input);
+    await this.#submitChatInput(message.chat.id, input, message.message_id);
   }
 
   async #handleDocumentMessage(message: TelegramMessage, caption: string): Promise<void> {
@@ -452,20 +476,20 @@ export class CodexAnywhereBridge {
       });
       input.push({ type: "mention", name, path: filePath });
     }
-    await this.#submitChatInput(message.chat.id, input);
+    await this.#submitChatInput(message.chat.id, input, message.message_id);
   }
 
-  async #submitChatInput(chatId: number, input: JsonObject[]): Promise<void> {
+  async #submitChatInput(chatId: number, input: JsonObject[], originMessageId: number | null = null): Promise<void> {
     const state = this.#chatState(chatId);
     const preparedInput = consumePendingMention(state, input);
     if (!state.activeTurnId) {
-      await this.#startTurn(chatId, preparedInput);
+      await this.#startTurn(chatId, preparedInput, undefined, originMessageId);
       return;
     }
 
     await this.#reconcileActiveTurnState(chatId);
     if (!state.activeTurnId) {
-      await this.#startTurn(chatId, preparedInput);
+      await this.#startTurn(chatId, preparedInput, undefined, originMessageId);
       return;
     }
 
@@ -840,7 +864,7 @@ export class CodexAnywhereBridge {
     }
   }
 
-  async #handleOmxCommand(chatId: number, args: string): Promise<void> {
+  async #handleOmxCommand(chatId: number, args: string, originMessageId: number | null = null): Promise<void> {
     let plan;
     try {
       plan = planOmxCommand(args);
@@ -856,7 +880,7 @@ export class CodexAnywhereBridge {
     }
 
     if (plan.kind === "skill") {
-      await this.#submitChatInput(chatId, [{ type: "text", text: plan.skillText ?? "" }]);
+      await this.#submitChatInput(chatId, [{ type: "text", text: plan.skillText ?? "" }], originMessageId);
       return;
     }
 
@@ -868,7 +892,7 @@ export class CodexAnywhereBridge {
     await this.#runOmxCommand(chatId, plan.argv);
   }
 
-  async #handleComputerCommand(chatId: number, args: string): Promise<void> {
+  async #handleComputerCommand(chatId: number, args: string, originMessageId: number | null = null): Promise<void> {
     const task = args.trim();
     if (!task) {
       await this.#sendText(chatId, "Usage: /computer <task>");
@@ -878,7 +902,7 @@ export class CodexAnywhereBridge {
     await this.#submitChatInput(chatId, [
       { type: "text", text: `${COMPUTER_USE_MENTION_TOKEN} ${task}` },
       { type: "mention", name: COMPUTER_USE_PLUGIN_NAME, path: COMPUTER_USE_PLUGIN_PATH },
-    ]);
+    ], originMessageId);
   }
 
   async #handleWorkspaceCommand(chatId: number, args: string): Promise<void> {
@@ -2115,20 +2139,20 @@ export class CodexAnywhereBridge {
     if (value === "status") {
       await this.#sendText(
         chatId,
-        `Detailed tool/file messages are ${state.verbose ? "on" : "off"}.`,
+        `Detailed tool output in run details is ${state.verbose ? "on" : "off"}.`,
       );
       return;
     }
     if (value === "on") {
       state.verbose = true;
       await this.#saveState();
-      await this.#sendText(chatId, "Detailed tool/file messages enabled.");
+      await this.#sendText(chatId, "Detailed tool output in run details enabled.");
       return;
     }
     if (value === "off") {
       state.verbose = false;
       await this.#saveState();
-      await this.#sendText(chatId, "Detailed tool/file messages disabled.");
+      await this.#sendText(chatId, "Detailed tool output in run details disabled.");
       return;
     }
     await this.#sendText(chatId, "Usage: /verbose [on|off|status]");
@@ -2782,6 +2806,30 @@ export class CodexAnywhereBridge {
       if (item && typeof item.id === "string") {
         this.#items.set(item.id, item);
       }
+      const turnId = asString(params.turnId);
+      const chatId = threadId ? this.#findChatIdByThread(threadId) : null;
+      if (threadId && turnId && chatId !== null && item) {
+        const itemType = asString(item.type);
+        if (itemType === "commandExecution") {
+          const command = asString(item.command) ?? "command";
+          await this.#updateTurnCardStatus(
+            threadId,
+            turnId,
+            chatId,
+            `Running command: ${truncatePlain(command, 120)}`,
+          );
+        } else if (itemType === "fileChange") {
+          await this.#updateTurnCardStatus(threadId, turnId, chatId, "Applying file changes");
+        } else if (itemType === "agentMessage") {
+          const phase = asString(item.phase);
+          await this.#updateTurnCardStatus(
+            threadId,
+            turnId,
+            chatId,
+            phase === "commentary" ? "Thinking" : "Writing final answer",
+          );
+        }
+      }
       return;
     }
 
@@ -2794,6 +2842,7 @@ export class CodexAnywhereBridge {
         this.#chatState(chatId).freshThread = false;
         await this.#saveState();
         this.#startTypingIndicator(chatId);
+        await this.#updateTurnCardStatus(threadId, turnId, chatId, "Thinking");
       }
       return;
     }
@@ -2842,14 +2891,23 @@ export class CodexAnywhereBridge {
         return;
       }
       if (itemType === "commandExecution") {
-        await this.#sendHtmlText(
+        await this.#appendTurnTrace(
+          threadId,
+          turnId,
           chatId,
-          formatCommandCompletionHtml(item, this.#chatState(chatId).verbose),
+          "Tool",
+          summarizeCommandTrace(item, this.#chatState(chatId).verbose),
         );
         return;
       }
       if (itemType === "fileChange") {
-        await this.#sendHtmlText(chatId, formatFileChangeCompletionHtml(item, this.#chatState(chatId).verbose));
+        await this.#appendTurnTrace(
+          threadId,
+          turnId,
+          chatId,
+          "Files",
+          summarizeFileChangeTrace(item),
+        );
       }
       return;
     }
@@ -2890,9 +2948,14 @@ export class CodexAnywhereBridge {
       const status = asString(turn.status) ?? "unknown";
       const error = (turn.error as JsonObject | undefined)?.message;
       const completionHtml = formatTurnCompletionHtml(status, typeof error === "string" ? error : null);
-      if (completionHtml) {
-        await this.#sendHtmlText(chatId, completionHtml);
-      }
+      await this.#finalizeTurnCard(
+        threadId,
+        turnId,
+        chatId,
+        status,
+        typeof error === "string" ? error : null,
+        completionHtml,
+      );
       if (queuedTurnInput) {
         await this.#sendHtmlText(chatId, formatPendingInputActionHtml("starting", queuedTurnInput));
         await this.#startTurn(chatId, queuedTurnInput);
@@ -2907,6 +2970,18 @@ export class CodexAnywhereBridge {
       }
       this.#stopTypingIndicator(chatId);
       const error = (params.error as JsonObject | undefined)?.message;
+      const activeTurnId = this.#chatState(chatId).activeTurnId;
+      if (activeTurnId) {
+        await this.#finalizeTurnCard(
+          threadId,
+          activeTurnId,
+          chatId,
+          "failed",
+          typeof error === "string" ? error : "unknown error",
+          `<b>Error</b>\n${escapeTelegramHtml(typeof error === "string" ? error : "unknown error")}`,
+        );
+        return;
+      }
       await this.#sendHtmlText(chatId, `<b>Error</b>\n${escapeTelegramHtml(typeof error === "string" ? error : "unknown error")}`);
     }
   }
@@ -3009,9 +3084,14 @@ export class CodexAnywhereBridge {
     chatId: number,
     input: JsonObject[],
     extraParams?: JsonObject,
+    originMessageId: number | null = null,
   ): Promise<void> {
     let threadId = await this.#resumeThread(chatId, true);
     const state = this.#chatState(chatId);
+    const origin = {
+      originMessageId,
+    };
+    this.#pendingChatOrigins.set(chatId, origin);
     let params = {
       threadId,
       input,
@@ -3024,6 +3104,7 @@ export class CodexAnywhereBridge {
       result = await this.#codex.call("turn/start", params);
     } catch (error) {
       if (!isMissingRolloutResumeError(error)) {
+        this.#pendingChatOrigins.delete(chatId);
         throw error;
       }
       this.#releaseThreadOwnership(threadId);
@@ -3040,16 +3121,24 @@ export class CodexAnywhereBridge {
         ...turnSessionOverrides(this.#config, this.#chatState(chatId)),
         ...(extraParams ?? {}),
       } satisfies JsonObject;
-      result = await this.#codex.call("turn/start", params);
+      try {
+        result = await this.#codex.call("turn/start", params);
+      } catch (retryError) {
+        this.#pendingChatOrigins.delete(chatId);
+        throw retryError;
+      }
     }
 
     const turn = result.turn as JsonObject | undefined;
     const turnId = asString(turn?.id);
     if (!turnId) {
+      this.#pendingChatOrigins.delete(chatId);
       throw new Error("Codex did not return a turn id.");
     }
     state.activeTurnId = turnId;
     state.freshThread = false;
+    this.#pendingTurnOrigins.set(turnKey(threadId, turnId), origin);
+    this.#pendingChatOrigins.delete(chatId);
     await this.#saveState();
   }
 
@@ -3252,33 +3341,22 @@ export class CodexAnywhereBridge {
     }
 
     const raw = stream.text || "🤖 Working on it…";
-    const chunks = splitTelegramChunks(raw);
-    const needsChunking = force && chunks.length > 1;
+    const card = await this.#ensureTurnCard(
+      stream.threadId,
+      stream.turnId,
+      stream.chatId,
+    );
 
-    // During streaming: show clamped tail in one message.
-    // On final flush with overflow: render all chunks as separate messages.
-    if (needsChunking) {
-      // Edit the existing streaming message with the first chunk.
-      const firstHtml = renderAssistantTextHtml(chunks[0]!);
-      if (stream.messageId === null) {
-        const message = await this.#telegram.sendMessage(stream.chatId, firstHtml, undefined, "HTML");
-        stream.messageId = message.message_id;
-      } else {
-        await this.#telegram.editMessageText(stream.chatId, stream.messageId, firstHtml, undefined, "HTML");
+    if (stream.phase === "commentary") {
+      card.currentStatus = latestStatusLine(raw) ?? "Thinking";
+      if (force && raw.trim()) {
+        this.#addTurnTrace(card, "Preamble", raw.trim());
       }
-      // Send remaining chunks as new messages.
-      for (let i = 1; i < chunks.length; i++) {
-        const html = renderAssistantTextHtml(chunks[i]!);
-        await this.#telegram.sendMessage(stream.chatId, html, undefined, "HTML");
-      }
+      await this.#flushTurnCard(card, { force });
     } else {
-      const html = renderAssistantTextHtml(clampTelegramText(raw));
-      if (stream.messageId === null) {
-        const message = await this.#telegram.sendMessage(stream.chatId, html, undefined, "HTML");
-        stream.messageId = message.message_id;
-      } else {
-        await this.#telegram.editMessageText(stream.chatId, stream.messageId, html, undefined, "HTML");
-      }
+      card.currentStatus = "Writing final answer";
+      card.finalText = raw;
+      await this.#flushTurnCard(card, { force });
     }
 
     stream.lastFlushAt = now;
@@ -3320,6 +3398,131 @@ export class CodexAnywhereBridge {
       );
     }
     return last;
+  }
+
+  async #ensureTurnCard(threadId: string, turnId: string, chatId: number): Promise<TurnCard> {
+    const key = turnKey(threadId, turnId);
+    const existing = this.#turnCards.get(key);
+    if (existing) {
+      return existing;
+    }
+
+    const origin = this.#pendingTurnOrigins.get(key) ?? this.#pendingChatOrigins.get(chatId);
+    const card: TurnCard = {
+      threadId,
+      turnId,
+      chatId,
+      messageId: null,
+      originMessageId: origin?.originMessageId ?? null,
+      currentStatus: "Thinking",
+      finalText: null,
+      trace: [],
+      lastEditAt: 0,
+      finalized: false,
+      overflowSent: false,
+    };
+    this.#turnCards.set(key, card);
+    await this.#flushTurnCard(card, { force: true });
+    return card;
+  }
+
+  async #updateTurnCardStatus(
+    threadId: string,
+    turnId: string,
+    chatId: number,
+    status: string,
+  ): Promise<void> {
+    const card = await this.#ensureTurnCard(threadId, turnId, chatId);
+    card.currentStatus = status;
+    await this.#flushTurnCard(card, { force: true });
+  }
+
+  async #appendTurnTrace(
+    threadId: string,
+    turnId: string,
+    chatId: number,
+    label: string,
+    text: string,
+  ): Promise<void> {
+    const card = await this.#ensureTurnCard(threadId, turnId, chatId);
+    this.#addTurnTrace(card, label, text);
+    card.currentStatus = compactTraceLine(label, text);
+    await this.#flushTurnCard(card, { force: true });
+  }
+
+  #addTurnTrace(card: TurnCard, label: string, text: string): void {
+    const normalized = text.trim();
+    if (!normalized) {
+      return;
+    }
+    const previous = card.trace.at(-1);
+    if (previous?.label === label && previous.text === normalized) {
+      return;
+    }
+    card.trace.push({ label, text: normalized });
+    if (card.trace.length > 40) {
+      card.trace.splice(0, card.trace.length - 40);
+    }
+  }
+
+  async #finalizeTurnCard(
+    threadId: string,
+    turnId: string,
+    chatId: number,
+    status: string,
+    errorMessage: string | null,
+    fallbackHtml: string | null,
+  ): Promise<void> {
+    const card = await this.#ensureTurnCard(threadId, turnId, chatId);
+    if (status !== "completed") {
+      card.finalText = errorMessage ? `Turn ${status}: ${errorMessage}` : `Turn ${status}`;
+      if (fallbackHtml) {
+        this.#addTurnTrace(card, "Status", stripTelegramHtml(fallbackHtml));
+      }
+    }
+    card.currentStatus = status === "completed" ? "Done" : `Turn ${status}`;
+    card.finalized = true;
+    await this.#flushTurnCard(card, { force: true });
+    this.#pendingTurnOrigins.delete(turnKey(threadId, turnId));
+    this.#pendingChatOrigins.delete(chatId);
+    this.#turnCards.delete(turnKey(threadId, turnId));
+  }
+
+  async #flushTurnCard(card: TurnCard, options: { force: boolean }): Promise<void> {
+    const now = Date.now();
+    if (!options.force && now - card.lastEditAt < this.#config.streamEditIntervalMs) {
+      return;
+    }
+
+    const chunks = buildTurnCardHtmlChunks(card);
+    const firstChunk = chunks[0] ?? renderLiveTurnCardHtml(card);
+    if (card.messageId === null) {
+      const message = await this.#telegram.sendMessage(
+        card.chatId,
+        firstChunk,
+        undefined,
+        "HTML",
+        card.originMessageId,
+      );
+      card.messageId = message.message_id;
+    } else {
+      await this.#telegram.editMessageText(card.chatId, card.messageId, firstChunk, undefined, "HTML");
+    }
+
+    if (card.finalized && !card.overflowSent && chunks.length > 1) {
+      for (let i = 1; i < chunks.length; i++) {
+        await this.#telegram.sendMessage(
+          card.chatId,
+          chunks[i]!,
+          undefined,
+          "HTML",
+          card.originMessageId,
+        );
+      }
+      card.overflowSent = true;
+    }
+
+    card.lastEditAt = now;
   }
 
   async #clearTurnControls(chatId: number, turnId: string): Promise<void> {
@@ -3624,7 +3827,7 @@ export class CodexAnywhereBridge {
     await this.#saveState();
     await this.#sendText(
       chatId,
-      `Detailed tool/file messages ${state.verbose ? "enabled" : "disabled"}.`,
+      `Detailed tool output in run details ${state.verbose ? "enabled" : "disabled"}.`,
     );
   }
 
@@ -4017,9 +4220,129 @@ class SessionOwnershipConflictError extends Error {
   }
 }
 
-function clampTelegramText(text: string): string {
-  if (text.length <= 3900) return text;
-  return "…\n\n" + text.slice(-(3900 - 3));
+function turnKey(threadId: string, turnId: string): string {
+  return `${threadId}:${turnId}`;
+}
+
+function buildTurnCardHtmlChunks(card: TurnCard): string[] {
+  if (!card.finalized) {
+    if (card.finalText) {
+      return [
+        joinTurnCardSections(
+          renderAssistantTextHtml(truncatePlain(card.finalText, 1400)),
+          renderTurnTraceHtml(card.trace),
+        ),
+      ];
+    }
+    return [renderLiveTurnCardHtml(card)];
+  }
+
+  const finalText = card.finalText?.trim() || "Done.";
+  return appendTurnTraceHtml(
+    splitTelegramChunks(finalText, 3000).map(renderAssistantTextHtml),
+    renderTurnTraceHtml(card.trace),
+  );
+}
+
+function renderLiveTurnCardHtml(card: TurnCard): string {
+  return joinTurnCardSections(
+    escapeTelegramHtml(truncatePlain(card.currentStatus, 1400)),
+    renderTurnTraceHtml(card.trace),
+  );
+}
+
+function appendTurnTraceHtml(chunks: string[], traceHtml: string): string[] {
+  if (chunks.length === 0) {
+    return [traceHtml];
+  }
+  const lastIndex = chunks.length - 1;
+  const lastChunk = chunks[lastIndex]!;
+  if (lastChunk.length + traceHtml.length + 2 <= 3900) {
+    chunks[lastIndex] = joinTurnCardSections(lastChunk, traceHtml);
+    return chunks;
+  }
+  return [...chunks, traceHtml];
+}
+
+function joinTurnCardSections(primaryHtml: string, detailsHtml: string): string {
+  return `${primaryHtml}\n\n${detailsHtml}`;
+}
+
+function renderTurnTraceHtml(trace: TurnTraceEntry[]): string {
+  const lines = ["Run details"];
+  if (trace.length === 0) {
+    lines.push("", "Waiting for activity.");
+  } else {
+    for (const [index, entry] of trace.entries()) {
+      lines.push(
+        "",
+        `${index + 1}. ${entry.label}: ${truncateMultiline(entry.text, 700)}`,
+      );
+    }
+  }
+  return `<blockquote expandable>${escapeTelegramHtml(truncateMultiline(lines.join("\n"), 2400))}</blockquote>`;
+}
+
+function latestStatusLine(text: string): string | null {
+  const line = text
+    .split(/\r?\n/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .at(-1);
+  return line ? truncatePlain(line.replace(/\s+/g, " "), 180) : null;
+}
+
+function compactTraceLine(label: string, text: string): string {
+  const line = latestStatusLine(text) ?? text.trim();
+  return `${label}: ${truncatePlain(line, 160)}`;
+}
+
+function summarizeCommandTrace(item: JsonObject, verbose: boolean): string {
+  const command = asString(item.command) ?? "<unknown>";
+  const status = asString(item.status) ?? "unknown";
+  const exitCode = typeof item.exitCode === "number" ? `, exit ${item.exitCode}` : "";
+  const output = verbose ? asString(item.aggregatedOutput) : null;
+  return [
+    `Command ${status}${exitCode}: ${command}`,
+    output ? `Output:\n${truncateMultiline(output, 1200)}` : null,
+  ].filter((line): line is string => Boolean(line)).join("\n");
+}
+
+function summarizeFileChangeTrace(item: JsonObject): string {
+  const status = asString(item.status) ?? "unknown";
+  const paths = collectItemChangePaths(item).slice(0, 6);
+  if (paths.length === 0) {
+    return `File changes ${status}.`;
+  }
+  return `File changes ${status}: ${paths.join(", ")}`;
+}
+
+function collectItemChangePaths(item: JsonObject): string[] {
+  const changes = Array.isArray(item.changes) ? item.changes : [];
+  return changes
+    .map((entry) =>
+      entry && typeof entry === "object" && "path" in entry ? String((entry as JsonObject).path) : null,
+    )
+    .filter((entry): entry is string => Boolean(entry));
+}
+
+function stripTelegramHtml(html: string): string {
+  return html
+    .replace(/<[^>]+>/g, "")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&amp;", "&");
+}
+
+function truncatePlain(text: string, maxLength: number): string {
+  if (text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function truncateMultiline(text: string, maxLength: number): string {
+  return truncatePlain(text.replace(/\n{3,}/g, "\n\n"), maxLength);
 }
 
 function formatRecentTurnsPreview(thread: JsonObject | undefined, limit: number): string | null {

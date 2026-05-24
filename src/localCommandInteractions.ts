@@ -153,7 +153,7 @@ export function buildVerboseInteractiveSession(state: ChatSessionState): LocalIn
     steps: [
       {
         key: "verboseMode",
-        prompt: `Detailed tool/file messages are currently ${state.verbose ? "on" : "off"}.`,
+        prompt: `Detailed tool output in run details is currently ${state.verbose ? "on" : "off"}.`,
         kind: "choice",
         options: [
           { label: "On", value: "on" },
