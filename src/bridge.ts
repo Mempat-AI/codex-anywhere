@@ -138,14 +138,14 @@ interface TurnCard {
   threadId: string;
   turnId: string;
   chatId: number;
-  messageId: number | null;
+  detailsMessageId: number | null;
   originMessageId: number | null;
   currentStatus: string;
   finalText: string | null;
   trace: TurnTraceEntry[];
   lastEditAt: number;
   finalized: boolean;
-  overflowSent: boolean;
+  finalSent: boolean;
 }
 
 interface InstalledCodexAnywhereCli {
@@ -3463,14 +3463,14 @@ export class CodexAnywhereBridge {
       threadId,
       turnId,
       chatId,
-      messageId: null,
+      detailsMessageId: null,
       originMessageId: origin?.originMessageId ?? null,
       currentStatus: "Thinking",
       finalText: null,
       trace: [],
       lastEditAt: 0,
       finalized: false,
-      overflowSent: false,
+      finalSent: false,
     };
     this.#turnCards.set(key, card);
     await this.#flushTurnCard(card, { force: true });
@@ -3545,32 +3545,31 @@ export class CodexAnywhereBridge {
       return;
     }
 
-    const chunks = buildTurnCardHtmlChunks(card);
-    const firstChunk = chunks[0] ?? renderLiveTurnCardHtml(card);
-    if (card.messageId === null) {
+    const detailsHtml = renderTurnDetailsCardHtml(card);
+    if (card.detailsMessageId === null) {
       const message = await this.#telegram.sendMessage(
         card.chatId,
-        firstChunk,
+        detailsHtml,
         undefined,
         "HTML",
         card.originMessageId,
       );
-      card.messageId = message.message_id;
+      card.detailsMessageId = message.message_id;
     } else {
-      await this.#telegram.editMessageText(card.chatId, card.messageId, firstChunk, undefined, "HTML");
+      await this.#telegram.editMessageText(card.chatId, card.detailsMessageId, detailsHtml, undefined, "HTML");
     }
 
-    if (card.finalized && !card.overflowSent && chunks.length > 1) {
-      for (let i = 1; i < chunks.length; i++) {
+    if (card.finalized && !card.finalSent) {
+      for (const chunk of buildTurnFinalHtmlChunks(card)) {
         await this.#telegram.sendMessage(
           card.chatId,
-          chunks[i]!,
+          chunk,
           undefined,
           "HTML",
           card.originMessageId,
         );
       }
-      card.overflowSent = true;
+      card.finalSent = true;
     }
 
     card.lastEditAt = now;
@@ -4275,50 +4274,6 @@ function turnKey(threadId: string, turnId: string): string {
   return `${threadId}:${turnId}`;
 }
 
-function buildTurnCardHtmlChunks(card: TurnCard): string[] {
-  if (!card.finalized) {
-    if (card.finalText) {
-      return [
-        joinTurnCardSections(
-          renderAssistantTextHtml(truncatePlain(card.finalText, 1400)),
-          renderTurnTraceHtml(card.trace),
-        ),
-      ];
-    }
-    return [renderLiveTurnCardHtml(card)];
-  }
-
-  const finalText = card.finalText?.trim() || "Done.";
-  return appendTurnTraceHtml(
-    splitTelegramChunks(finalText, 3000).map(renderAssistantTextHtml),
-    renderTurnTraceHtml(card.trace),
-  );
-}
-
-function renderLiveTurnCardHtml(card: TurnCard): string {
-  return joinTurnCardSections(
-    escapeTelegramHtml(truncatePlain(card.currentStatus, 1400)),
-    renderTurnTraceHtml(card.trace),
-  );
-}
-
-function appendTurnTraceHtml(chunks: string[], traceHtml: string): string[] {
-  if (chunks.length === 0) {
-    return [traceHtml];
-  }
-  const lastIndex = chunks.length - 1;
-  const lastChunk = chunks[lastIndex]!;
-  if (lastChunk.length + traceHtml.length + 2 <= 3900) {
-    chunks[lastIndex] = joinTurnCardSections(lastChunk, traceHtml);
-    return chunks;
-  }
-  return [...chunks, traceHtml];
-}
-
-function joinTurnCardSections(primaryHtml: string, detailsHtml: string): string {
-  return `${primaryHtml}\n\n${detailsHtml}`;
-}
-
 function renderTurnTraceHtml(trace: TurnTraceEntry[]): string {
   const lines = ["Run details"];
   if (trace.length === 0) {
@@ -4332,6 +4287,22 @@ function renderTurnTraceHtml(trace: TurnTraceEntry[]): string {
     }
   }
   return `<blockquote expandable>${escapeTelegramHtml(truncateMultiline(lines.join("\n"), 2400))}</blockquote>`;
+}
+
+function renderTurnDetailsCardHtml(card: TurnCard): string {
+  if (card.finalized) {
+    return renderTurnTraceHtml(card.trace);
+  }
+  return [
+    escapeTelegramHtml(truncatePlain(card.currentStatus, 1400)),
+    "",
+    renderTurnTraceHtml(card.trace),
+  ].join("\n");
+}
+
+function buildTurnFinalHtmlChunks(card: TurnCard): string[] {
+  const finalText = card.finalText?.trim() || "Done.";
+  return splitTelegramChunks(finalText, 3900).map(renderAssistantTextHtml);
 }
 
 function latestStatusLine(text: string): string | null {

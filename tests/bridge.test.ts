@@ -359,14 +359,22 @@ test("final agent message chunks are sent from the turn card only once", async (
     },
   });
 
-  assert.equal(telegram.sentMessages.length, 3);
+  assert.equal(telegram.sentMessages.length, 4);
+  assert.match(telegram.sentMessages[0]!.text, /Run details/);
+  assert.doesNotMatch(telegram.sentMessages[0]!.text, /^a+$/);
   assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[2]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[3]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
+  assert.equal(telegram.sentMessages[2]!.parseMode, "HTML");
+  assert.equal(telegram.sentMessages[3]!.parseMode, "HTML");
   assert.equal(telegram.editedMessages.length, 2);
   assert.equal(telegram.editedMessages[1]!.messageId, 1);
+  assert.match(telegram.editedMessages[1]!.text, /Run details/);
+  assert.doesNotMatch(telegram.editedMessages[1]!.text, /^a+$/);
 });
 
-test("turn card combines live output and run details in one reply card", async () => {
+test("turn card keeps run details above a fresh final answer message", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
@@ -437,21 +445,24 @@ test("turn card combines live output and run details in one reply card", async (
     },
   });
 
-  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /<blockquote expandable>/);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
   assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
+  assert.equal(telegram.sentMessages[1]!.text, "Done.");
   assert.ok(telegram.editedMessages.length >= 1);
   const finalEdit = telegram.editedMessages.at(-1)!;
   assert.equal(finalEdit.messageId, 1);
-  assert.match(finalEdit.text, /^Done\./);
   assert.match(finalEdit.text, /<blockquote expandable>/);
   assert.match(finalEdit.text, /Run details/);
   assert.match(finalEdit.text, /Preamble:/);
   assert.match(finalEdit.text, /Tool:/);
   assert.match(finalEdit.text, /pnpm test/);
+  assert.doesNotMatch(finalEdit.text, /^Done\./);
   assert.doesNotMatch(finalEdit.text, /Working on:/);
   assert.doesNotMatch(finalEdit.text, /Current:/);
 });
