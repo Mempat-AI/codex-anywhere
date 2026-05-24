@@ -148,6 +148,12 @@ interface TurnCard {
   overflowSent: boolean;
 }
 
+interface InstalledCodexAnywhereCli {
+  nodePath: string;
+  cliPath: string;
+  versionLine: string;
+}
+
 export interface CodexAnywhereBridgeDeps {
   telegram?: TelegramClient;
   codex?: CodexClient;
@@ -3219,16 +3225,22 @@ export class CodexAnywhereBridge {
           maxBuffer: 1024 * 1024,
         },
       );
+      const installedCli = await this.#resolveInstalledCodexAnywhereCli();
       const summary = summarizeUpgradeOutput(install.stdout, install.stderr);
       await this.#sendHtmlText(
         chatId,
         [
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
+          `Verified <code>${escapeTelegramHtml(installedCli.versionLine)}</code>.`,
           "Scheduling a detached service restart from the official package now. Send /version after a few seconds to confirm.",
         ].join("\n"),
       );
-      await this.#execFile("sh", ["-c", buildDetachedServiceRestartCommand()], {
+      await this.#execFile("sh", ["-c", buildDetachedServiceRestartCommand({
+        nodePath: installedCli.nodePath,
+        cliPath: installedCli.cliPath,
+        storageRoot: path.dirname(this.#configPath),
+      })], {
         cwd: this.#config.workspaceCwd,
         env: process.env,
         timeout: 10_000,
@@ -3245,6 +3257,45 @@ export class CodexAnywhereBridge {
         ].join("\n"),
       );
     }
+  }
+
+  async #resolveInstalledCodexAnywhereCli(): Promise<InstalledCodexAnywhereCli> {
+    const root = await this.#execFile(
+      "npm",
+      ["root", "-g"],
+      {
+        cwd: this.#config.workspaceCwd,
+        env: process.env,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    const globalRoot = lastNonEmptyLine(root.stdout);
+    if (!globalRoot) {
+      throw new Error("npm root -g did not return a global package directory.");
+    }
+
+    const cliPath = path.join(globalRoot, "codex-anywhere", "dist", "cli.js");
+    const version = await this.#execFile(
+      process.execPath,
+      [cliPath, "--version"],
+      {
+        cwd: this.#config.workspaceCwd,
+        env: process.env,
+        timeout: 30_000,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    const versionLine = lastNonEmptyLine(version.stdout);
+    if (!versionLine || !/^codex-anywhere \d+\.\d+\.\d+(?:[-+][^\s]+)?$/.test(versionLine)) {
+      throw new Error(`Installed codex-anywhere CLI did not report a valid version: ${versionLine || "<empty>"}`);
+    }
+
+    return {
+      nodePath: process.execPath,
+      cliPath,
+      versionLine,
+    };
   }
 
   async #sendApprovalPrompt(chatId: number, token: string, method: string, params: JsonObject): Promise<void> {
@@ -5038,19 +5089,36 @@ function summarizeUpgradeOutput(stdout: string, stderr: string): string {
   return lines.slice(-6).join("\n") || "npm install completed";
 }
 
-function buildDetachedServiceRestartCommand(): string {
-  const logPath = path.join(os.tmpdir(), "codex-anywhere-upgrade-install-service.log");
+function lastNonEmptyLine(text: string): string | null {
+  return text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .at(-1) ?? null;
+}
+
+function buildDetachedServiceRestartCommand(options: {
+  nodePath: string;
+  cliPath: string;
+  storageRoot: string;
+}): string {
+  const logDir = path.join(options.storageRoot, "logs");
+  const logPath = path.join(logDir, "upgrade-restart.log");
+  const serviceCommand = `${shellQuote(options.nodePath)} ${shellQuote(options.cliPath)}`;
   const script = [
     "sleep 3",
+    `export CODEX_ANYWHERE_HOME=${shellQuote(options.storageRoot)}`,
+    `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') using ${serviceCommand}"`,
+    `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') installed version: $(${serviceCommand} --version 2>&1)"`,
     "for attempt in 1 2 3 4 5; do",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service attempt ${attempt}\"",
-    "  if codex-anywhere restart-service; then",
+    `  if ${serviceCommand} restart-service; then`,
     "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service succeeded\"",
     "    exit 0",
     "  fi",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service failed\"",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service attempt ${attempt}\"",
-    "  if codex-anywhere install-service; then",
+    `  if ${serviceCommand} install-service; then`,
     "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service succeeded\"",
     "    exit 0",
     "  fi",
@@ -5059,7 +5127,7 @@ function buildDetachedServiceRestartCommand(): string {
     "done",
     "exit 1",
   ].join("\n");
-  return `nohup sh -c ${shellQuote(script)} >${shellQuote(logPath)} 2>&1 &`;
+  return `mkdir -p ${shellQuote(logDir)} && nohup sh -c ${shellQuote(script)} >${shellQuote(logPath)} 2>&1 &`;
 }
 
 function shellQuote(value: string): string {
