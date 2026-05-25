@@ -152,7 +152,7 @@ export function normalizeSandboxMode(value: string): SandboxMode | null {
 export function codexSlashHelpText(): string {
   return [
     "Codex Anywhere commands:",
-    "/start, /help, /new, /resume, /continue, /reload, /interrupt, /cancel, /status, /version, /upgrade, /workspace <path>, /addbot, /download <path>, /omx <args>, /computer <task>",
+    "/start, /help, /new, /resume, /continue, /reload, /interrupt, /cancel, /status, /version, /upgrade, /upgrade test, /workspace <path>, /addbot, /download <path>, /omx <args>, /computer <task>",
     "Telegram will also show the registered command list when you type /",
     "",
     "Bridge-managed commands and bridged Codex slash commands:",
@@ -166,7 +166,7 @@ export function codexSlashHelpText(): string {
     "/plan [task]",
     "/collab [mode]",
     "/agent, /subagents",
-    "/resume, /continue [session-id], /reload, /upgrade",
+    "/resume, /continue [session-id], /reload, /upgrade, /upgrade test",
     "/review [base <branch>|commit <sha>|<custom instructions>]",
     "/rename <name>, /fork, /compact, /clear",
     "/diff, /copy, /mention <query>, /skills, /mcp, /apps, /plugins, /feedback, /verbose [on|off|status]",

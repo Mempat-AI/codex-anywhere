@@ -1635,7 +1635,6 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.match(restartCommand, /upgrade-restart\.log/);
   if (process.platform === "darwin") {
     assert.match(restartCommand, /launchctl bootstrap/);
-    assert.match(restartCommand, /launchctl kickstart -k/);
     assert.match(restartCommand, /ai\.mempat\.codex-anywhere\.upgrade-restart/);
     assert.doesNotMatch(restartCommand, /nohup sh -c 'sleep 3/);
   } else if (process.platform === "linux") {
@@ -1689,6 +1688,39 @@ test("/upgrade reports installed CLI verification failures", async () => {
   assert.match(telegram.sentMessages[1]!.text, /did not report a valid version/);
 });
 
+test("/upgrade test runs the supervised restart probe without installing", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-test-"));
+  const execCalls: Array<{ file: string; args: string[] }> = [];
+  const bridge = new CodexAnywhereBridge(testConfig(), path.join(tempDir, "config.json"), path.join(tempDir, "state.json"), {
+    telegram,
+    codex,
+    initialState: testState(),
+    execFile: async (file, args) => {
+      execCalls.push({ file, args });
+      assert.equal(file, "sh");
+      const command = args[1] ?? "";
+      const markerMatch = /([/\w.-]+upgrade-restart-test-([a-f0-9]+)\.ok)/.exec(command);
+      assert.ok(markerMatch);
+      await fs.mkdir(path.dirname(markerMatch[1]!), { recursive: true });
+      await fs.writeFile(markerMatch[1]!, markerMatch[2]!, "utf8");
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/upgrade test"));
+
+  assert.equal(execCalls.length, 1);
+  const restartCommand = execCalls[0]!.args[1]!;
+  assert.match(restartCommand, /upgrade-restart-test/);
+  assert.doesNotMatch(restartCommand, /npm install/);
+  assert.equal(telegram.sentMessages.length, 2);
+  assert.match(telegram.sentMessages[0]!.text, /Upgrade self-test started/);
+  assert.match(telegram.sentMessages[1]!.text, /Upgrade self-test passed/);
+  assert.match(telegram.sentMessages[1]!.text, /supervised helper ran/);
+});
+
 test("/upgrade rejects arguments", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
@@ -1706,7 +1738,7 @@ test("/upgrade rejects arguments", async () => {
   await bridge.handleUpdateForTest(telegramMessageUpdate("/upgrade 0.3.3"));
 
   assert.deepEqual(execCalls, []);
-  assert.equal(telegram.sentMessages[0]!.text, "Usage: /upgrade");
+  assert.equal(telegram.sentMessages[0]!.text, "Usage: /upgrade\n/upgrade test");
 });
 
 test("/upgrade reports install failures", async () => {

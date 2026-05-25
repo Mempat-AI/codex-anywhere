@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -76,6 +76,12 @@ import {
   formatTurnControlCallbackData,
   parseTurnControlCallbackData,
 } from "./turnControls.js";
+import {
+  buildUpgradeRestartProbeCommand,
+  buildUpgradeServiceRestartCommand,
+  readUpgradeRestartLogTail,
+  waitForUpgradeRestartProbe,
+} from "./upgradeRestart.js";
 import type {
   BotRuntimeConfig,
   ChatSessionState,
@@ -3190,8 +3196,13 @@ export class CodexAnywhereBridge {
   }
 
   async #upgradeSelf(chatId: number, args: string): Promise<void> {
-    if (args.trim()) {
-      await this.#sendText(chatId, "Usage: /upgrade");
+    const trimmedArgs = args.trim();
+    if (trimmedArgs === "test" || trimmedArgs === "check") {
+      await this.#testUpgradeRestart(chatId);
+      return;
+    }
+    if (trimmedArgs) {
+      await this.#sendText(chatId, "Usage: /upgrade\n/upgrade test");
       return;
     }
 
@@ -3236,12 +3247,11 @@ export class CodexAnywhereBridge {
           "Scheduling a supervised service restart from the official package now. Send /version after a few seconds to confirm.",
         ].join("\n"),
       );
-      await this.#execFile("sh", ["-c", buildDetachedServiceRestartCommand({
+      await this.#execFile("sh", ["-c", buildUpgradeServiceRestartCommand({
         nodePath: installedCli.nodePath,
         cliPath: installedCli.cliPath,
         storageRoot: path.dirname(this.#configPath),
         platform: process.platform,
-        homeDir: os.homedir(),
         uid: typeof process.getuid === "function" ? process.getuid() : undefined,
       })], {
         cwd: this.#config.workspaceCwd,
@@ -3259,6 +3269,62 @@ export class CodexAnywhereBridge {
           "Run <code>npm install -g codex-anywhere@latest</code>, then <code>codex-anywhere install-service</code> manually.",
         ].join("\n"),
       );
+    }
+  }
+
+  async #testUpgradeRestart(chatId: number): Promise<void> {
+    const state = this.#chatState(chatId);
+    if (state.activeTurnId) {
+      await this.#reconcileActiveTurnState(chatId);
+    }
+    if (state.activeTurnId) {
+      await this.#sendText(chatId, "/upgrade test is disabled while a task is in progress.");
+      return;
+    }
+
+    const probe = buildUpgradeRestartProbeCommand({
+      storageRoot: path.dirname(this.#configPath),
+      platform: process.platform,
+      uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+    });
+
+    await this.#sendHtmlText(
+      chatId,
+      [
+        "<b>Upgrade self-test started</b>",
+        "Scheduling a supervised restart helper probe through the same launchd/systemd path used by <code>/upgrade</code>.",
+      ].join("\n"),
+    );
+
+    try {
+      await this.#execFile("sh", ["-c", probe.command], {
+        cwd: this.#config.workspaceCwd,
+        env: process.env,
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+      });
+      await waitForUpgradeRestartProbe(probe, { timeoutMs: 10_000, intervalMs: 250 });
+      await fs.rm(probe.markerPath, { force: true });
+      await this.#sendHtmlText(
+        chatId,
+        [
+          "<b>Upgrade self-test passed</b>",
+          "The supervised helper ran outside the bot process and wrote its probe marker.",
+          `Log: <code>${escapeTelegramHtml(probe.logPath)}</code>`,
+        ].join("\n"),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const logTail = await readUpgradeRestartLogTail(probe.logPath);
+      const lines = [
+        "<b>Upgrade self-test failed</b>",
+        `<code>${escapeTelegramHtml(message)}</code>`,
+        `Log: <code>${escapeTelegramHtml(probe.logPath)}</code>`,
+      ];
+      if (logTail) {
+        lines.push("", "<b>Log tail</b>", `<code>${escapeTelegramHtml(logTail)}</code>`);
+      }
+      await this.#sendHtmlText(chatId, lines.join("\n"));
     }
   }
 
@@ -5069,174 +5135,6 @@ function lastNonEmptyLine(text: string): string | null {
     .map((line) => line.trim())
     .filter(Boolean)
     .at(-1) ?? null;
-}
-
-function buildDetachedServiceRestartCommand(options: {
-  nodePath: string;
-  cliPath: string;
-  storageRoot: string;
-  platform?: NodeJS.Platform;
-  homeDir?: string;
-  uid?: number;
-}): string {
-  const logDir = path.join(options.storageRoot, "logs");
-  const logPath = path.join(logDir, "upgrade-restart.log");
-  const serviceCommand = `${shellQuote(options.nodePath)} ${shellQuote(options.cliPath)}`;
-  const script = buildUpgradeRestartScript({
-    serviceCommand,
-    storageRoot: options.storageRoot,
-    logPath,
-  });
-  if (options.platform === "darwin") {
-    return buildMacosUpgradeRestartCommand({
-      script,
-      logDir,
-      logPath,
-      storageRoot: options.storageRoot,
-      homeDir: options.homeDir ?? os.homedir(),
-      uid: options.uid,
-    });
-  }
-  if (options.platform === "linux") {
-    return buildLinuxUpgradeRestartCommand({
-      script,
-      logDir,
-      storageRoot: options.storageRoot,
-    });
-  }
-  return buildNohupUpgradeRestartCommand({ script, logDir });
-}
-
-function buildUpgradeRestartScript(options: {
-  serviceCommand: string;
-  storageRoot: string;
-  logPath: string;
-}): string {
-  const { serviceCommand } = options;
-  return [
-    `exec >>${shellQuote(options.logPath)} 2>&1`,
-    "sleep 3",
-    `export CODEX_ANYWHERE_HOME=${shellQuote(options.storageRoot)}`,
-    `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') using ${serviceCommand}"`,
-    `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') installed version: $(${serviceCommand} --version 2>&1)"`,
-    "for attempt in 1 2 3 4 5; do",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service attempt ${attempt}\"",
-    `  if ${serviceCommand} restart-service; then`,
-    "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service succeeded\"",
-    "    exit 0",
-    "  fi",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service failed\"",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service attempt ${attempt}\"",
-    `  if ${serviceCommand} install-service; then`,
-    "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service succeeded\"",
-    "    exit 0",
-    "  fi",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service failed\"",
-    "  sleep 3",
-    "done",
-    "exit 1",
-  ].join("\n");
-}
-
-function buildMacosUpgradeRestartCommand(options: {
-  script: string;
-  logDir: string;
-  logPath: string;
-  storageRoot: string;
-  homeDir: string;
-  uid?: number;
-}): string {
-  if (options.uid === undefined) {
-    return buildNohupUpgradeRestartCommand({ script: options.script, logDir: options.logDir });
-  }
-  const helperId = createHash("sha256").update(options.storageRoot).digest("hex").slice(0, 12);
-  const label = `ai.mempat.codex-anywhere.upgrade-restart.${helperId}`;
-  const domainTarget = `gui/${options.uid}`;
-  const serviceTarget = `${domainTarget}/${label}`;
-  const plistPath = path.join(options.homeDir, "Library", "LaunchAgents", `${label}.plist`);
-  const plist = renderUpgradeLaunchAgentPlist({
-    label,
-    script: options.script,
-    logPath: options.logPath,
-  });
-  return [
-    `mkdir -p ${shellQuote(options.logDir)} ${shellQuote(path.dirname(plistPath))}`,
-    `printf %s ${shellQuote(plist)} >${shellQuote(plistPath)}`,
-    `(launchctl bootout ${shellQuote(domainTarget)} ${shellQuote(plistPath)} >/dev/null 2>&1 || true)`,
-    `launchctl bootstrap ${shellQuote(domainTarget)} ${shellQuote(plistPath)}`,
-    `launchctl kickstart -k ${shellQuote(serviceTarget)}`,
-  ].join(" && ");
-}
-
-function renderUpgradeLaunchAgentPlist(options: {
-  label: string;
-  script: string;
-  logPath: string;
-}): string {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>${escapeXml(options.label)}</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/bin/sh</string>
-    <string>-c</string>
-    <string>${escapeXml(options.script)}</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>${escapeXml(options.logPath)}</string>
-  <key>StandardErrorPath</key>
-  <string>${escapeXml(options.logPath)}</string>
-</dict>
-</plist>
-`;
-}
-
-function buildLinuxUpgradeRestartCommand(options: {
-  script: string;
-  logDir: string;
-  storageRoot: string;
-}): string {
-  const unitId = createHash("sha256").update(options.storageRoot).digest("hex").slice(0, 12);
-  const unitName = `codex-anywhere-upgrade-restart-${unitId}`;
-  const systemdScript = [
-    `systemctl --user stop ${shellQuote(`${unitName}.service`)} >/dev/null 2>&1 || true`,
-    `systemctl --user reset-failed ${shellQuote(`${unitName}.service`)} >/dev/null 2>&1 || true`,
-    `systemd-run --user --unit=${shellQuote(unitName)} --collect /bin/sh -c ${shellQuote(options.script)}`,
-  ].join("\n");
-  const fallbackScript = `nohup sh -c ${shellQuote(options.script)} >/dev/null 2>&1 &`;
-  return [
-    `mkdir -p ${shellQuote(options.logDir)}`,
-    "if command -v systemd-run >/dev/null 2>&1; then",
-    systemdScript,
-    "else",
-    fallbackScript,
-    "fi",
-  ].join("\n");
-}
-
-function buildNohupUpgradeRestartCommand(options: {
-  script: string;
-  logDir: string;
-}): string {
-  return `mkdir -p ${shellQuote(options.logDir)} && nohup sh -c ${shellQuote(options.script)} >/dev/null 2>&1 &`;
-}
-
-function escapeXml(value: string): string {
-  return value
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&apos;");
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function parseAccountLoginArgs(args: string): { ok: true; params: JsonObject } | { ok: false; message: string } {
