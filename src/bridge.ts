@@ -82,6 +82,10 @@ import {
   readUpgradeRestartLogTail,
   waitForUpgradeRestartProbe,
 } from "./upgradeRestart.js";
+import {
+  appendUpgradeDiagnosticEvent,
+  upgradeDiagnosticsPaths,
+} from "./upgradeDiagnostics.js";
 import type {
   BotRuntimeConfig,
   ChatSessionState,
@@ -3270,6 +3274,17 @@ export class CodexAnywhereBridge {
     }
 
     try {
+      const diagnosticStatePath = pending.diagnosticStatePath
+        ?? upgradeDiagnosticsPaths(path.dirname(this.#configPath)).statePath;
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId: pending.attemptId ?? `legacy-${pending.startedAt}`,
+        botId: this.#botId,
+        chatId: pending.chatId,
+        event: "upgrade-completed",
+        fromVersion: pending.fromVersion,
+        targetVersionLine: pending.targetVersionLine,
+        watchdogMarkerPath: pending.watchdogMarkerPath ?? null,
+      });
       await this.#sendHtmlText(
         pending.chatId,
         [
@@ -3277,6 +3292,7 @@ export class CodexAnywhereBridge {
           `Now running <code>codex-anywhere ${escapeTelegramHtml(packageJson.version)}</code>.`,
           `Installed target: <code>${escapeTelegramHtml(pending.targetVersionLine)}</code>.`,
           "The restarted service reached Telegram successfully.",
+          `Diagnostics: <code>${escapeTelegramHtml(diagnosticStatePath)}</code>`,
         ].join("\n"),
       );
       await this.#writeUpgradeWatchdogMarker(pending, "completed");
@@ -3294,6 +3310,18 @@ export class CodexAnywhereBridge {
     }
 
     try {
+      const diagnosticStatePath = pending.diagnosticStatePath
+        ?? upgradeDiagnosticsPaths(path.dirname(this.#configPath)).statePath;
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId: pending.attemptId ?? `legacy-${pending.startedAt}`,
+        botId: this.#botId,
+        chatId: pending.chatId,
+        event: "upgrade-startup-failed",
+        error: formatErrorMessage(error),
+        fromVersion: pending.fromVersion,
+        targetVersionLine: pending.targetVersionLine,
+        watchdogMarkerPath: pending.watchdogMarkerPath ?? null,
+      });
       await this.#sendHtmlText(
         pending.chatId,
         [
@@ -3301,6 +3329,7 @@ export class CodexAnywhereBridge {
           `Installed target: <code>${escapeTelegramHtml(pending.targetVersionLine)}</code>.`,
           "The service restarted but did not reach Codex initialization.",
           `<code>${escapeTelegramHtml(formatErrorMessage(error))}</code>`,
+          `Diagnostics: <code>${escapeTelegramHtml(diagnosticStatePath)}</code>`,
         ].join("\n"),
       );
       await this.#writeUpgradeWatchdogMarker(pending, "startup-failed");
@@ -3308,6 +3337,18 @@ export class CodexAnywhereBridge {
       await this.#saveState();
     } catch (notifyError) {
       this.#logRuntimeError("upgrade startup failure notification", notifyError);
+    }
+  }
+
+  async #appendUpgradeDiagnosticEvent(event: {
+    attemptId: string;
+    event: string;
+    [key: string]: unknown;
+  }): Promise<void> {
+    try {
+      await appendUpgradeDiagnosticEvent(path.dirname(this.#configPath), event);
+    } catch (error) {
+      this.#logRuntimeError("upgrade diagnostics", error);
     }
   }
 
@@ -3350,10 +3391,25 @@ export class CodexAnywhereBridge {
       return;
     }
 
+    const storageRoot = path.dirname(this.#configPath);
+    const attemptId = randomBytes(8).toString("hex");
+    const diagnostics = upgradeDiagnosticsPaths(storageRoot);
+    const restartLogPath = path.join(storageRoot, "logs", "upgrade-restart.log");
+    await this.#appendUpgradeDiagnosticEvent({
+      attemptId,
+      botId: this.#botId,
+      chatId,
+      event: "upgrade-started",
+      fromVersion: packageJson.version,
+      restartLogPath,
+      workspaceCwd: this.#config.workspaceCwd,
+    });
+
     const startLines = [
       "<b>Upgrade started</b>",
       "Installing <code>codex-anywhere@latest</code> with npm.",
       "If installation succeeds, the background service will be restarted from the official package.",
+      `Diagnostics: <code>${escapeTelegramHtml(diagnostics.statePath)}</code>`,
     ];
     await this.#sendHtmlText(
       chatId,
@@ -3374,18 +3430,31 @@ export class CodexAnywhereBridge {
       );
       const installedCli = await this.#resolveInstalledCodexAnywhereCli();
       const summary = summarizeUpgradeOutput(install.stdout, install.stderr);
-      const storageRoot = path.dirname(this.#configPath);
       const watchdogMarkerPath = path.join(
         storageRoot,
         "logs",
         `upgrade-restart-watchdog-${randomBytes(8).toString("hex")}.ok`,
       );
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId,
+        botId: this.#botId,
+        chatId,
+        event: "upgrade-installed",
+        fromVersion: packageJson.version,
+        installSummary: summary,
+        targetVersionLine: installedCli.versionLine,
+        watchdogMarkerPath,
+        restartLogPath,
+      });
       this.#state.pendingUpgradeNotification = {
         chatId,
         fromVersion: packageJson.version,
         targetVersionLine: installedCli.versionLine,
         startedAt: Date.now(),
         failureNotifiedAt: null,
+        attemptId,
+        diagnosticJournalPath: diagnostics.journalPath,
+        diagnosticStatePath: diagnostics.statePath,
         watchdogMarkerPath,
       };
       await this.#saveState();
@@ -3399,6 +3468,9 @@ export class CodexAnywhereBridge {
           "Scheduling a supervised service restart from the official package now.",
           "The restarted service will send an automatic completion message when it is responsive.",
           "If it never becomes reachable, the restart helper will send a failure message directly.",
+          `Diagnostics: <code>${escapeTelegramHtml(diagnostics.statePath)}</code>`,
+          `Events: <code>${escapeTelegramHtml(diagnostics.journalPath)}</code>`,
+          `Restart log: <code>${escapeTelegramHtml(restartLogPath)}</code>`,
         ].join("\n"),
       ).catch((error) => {
         this.#logRuntimeError("upgrade installed notification", error);
@@ -3412,6 +3484,9 @@ export class CodexAnywhereBridge {
         botId: this.#botId,
         chatId,
         targetVersionLine: installedCli.versionLine,
+        upgradeAttemptId: attemptId,
+        diagnosticJournalPath: diagnostics.journalPath,
+        diagnosticStatePath: diagnostics.statePath,
         watchdogMarkerPath,
         pathEnv: process.env.PATH,
         platform: process.platform,
@@ -3422,7 +3497,23 @@ export class CodexAnywhereBridge {
         timeout: 10_000,
         maxBuffer: 1024 * 1024,
       });
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId,
+        botId: this.#botId,
+        chatId,
+        event: "upgrade-helper-scheduled",
+        targetVersionLine: installedCli.versionLine,
+        watchdogMarkerPath,
+        restartLogPath,
+      });
     } catch (error) {
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId,
+        botId: this.#botId,
+        chatId,
+        event: "upgrade-failed",
+        error: formatErrorMessage(error),
+      });
       if (pendingUpgradeSaved) {
         this.#state.pendingUpgradeNotification = null;
         await this.#saveState();
@@ -3433,6 +3524,7 @@ export class CodexAnywhereBridge {
         [
           "<b>Upgrade failed</b>",
           `<code>${escapeTelegramHtml(message)}</code>`,
+          `Diagnostics: <code>${escapeTelegramHtml(diagnostics.statePath)}</code>`,
           "Run <code>npm install -g codex-anywhere@latest</code>, then <code>codex-anywhere install-service</code> manually.",
         ].join("\n"),
       );

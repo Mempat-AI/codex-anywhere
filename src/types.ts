@@ -75,6 +75,9 @@ export interface PendingUpgradeNotification {
   targetVersionLine: string;
   startedAt: number;
   failureNotifiedAt: number | null;
+  attemptId?: string | null;
+  diagnosticJournalPath?: string | null;
+  diagnosticStatePath?: string | null;
   watchdogMarkerPath?: string | null;
 }
 

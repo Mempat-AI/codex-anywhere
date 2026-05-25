@@ -43,6 +43,9 @@ export async function loadState(statePath: string): Promise<StoredState> {
     chat.lastAssistantMessage ??= null;
   }
   if (state.pendingUpgradeNotification) {
+    state.pendingUpgradeNotification.attemptId ??= null;
+    state.pendingUpgradeNotification.diagnosticJournalPath ??= null;
+    state.pendingUpgradeNotification.diagnosticStatePath ??= null;
     state.pendingUpgradeNotification.watchdogMarkerPath ??= null;
   }
   return state;

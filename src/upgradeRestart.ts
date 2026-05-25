@@ -24,6 +24,9 @@ export function buildUpgradeServiceRestartCommand(options: {
   botId: string;
   chatId: number;
   targetVersionLine: string;
+  upgradeAttemptId: string;
+  diagnosticJournalPath: string;
+  diagnosticStatePath: string;
   watchdogMarkerPath: string;
   pathEnv?: string;
   watchdogTimeoutSeconds?: number;
@@ -41,6 +44,9 @@ export function buildUpgradeServiceRestartCommand(options: {
     botId: options.botId,
     chatId: options.chatId,
     targetVersionLine: options.targetVersionLine,
+    upgradeAttemptId: options.upgradeAttemptId,
+    diagnosticJournalPath: options.diagnosticJournalPath,
+    diagnosticStatePath: options.diagnosticStatePath,
     watchdogMarkerPath: options.watchdogMarkerPath,
     watchdogTimeoutSeconds: options.watchdogTimeoutSeconds ?? 75,
     pathEnv: options.pathEnv,
@@ -131,40 +137,119 @@ function buildUpgradeRestartScript(options: {
   botId: string;
   chatId: number;
   targetVersionLine: string;
+  upgradeAttemptId: string;
+  diagnosticJournalPath: string;
+  diagnosticStatePath: string;
   watchdogMarkerPath: string;
   watchdogTimeoutSeconds: number;
   pathEnv?: string;
 }): string {
   const { serviceCommand } = options;
   const watchdogCommand = buildUpgradeWatchdogCommand(options);
+  const diagnosticShellFunction = buildUpgradeDiagnosticShellFunction({
+    nodePath: options.nodePath,
+    attemptId: options.upgradeAttemptId,
+    botId: options.botId,
+    chatId: options.chatId,
+    diagnosticJournalPath: options.diagnosticJournalPath,
+    diagnosticStatePath: options.diagnosticStatePath,
+    targetVersionLine: options.targetVersionLine,
+    watchdogMarkerPath: options.watchdogMarkerPath,
+    logPath: options.logPath,
+  });
   return [
     `exec >>${shellQuote(options.logPath)} 2>&1`,
     "sleep 3",
     ...(options.pathEnv ? [`export PATH=${shellQuote(options.pathEnv)}`] : []),
     `export CODEX_ANYWHERE_HOME=${shellQuote(options.storageRoot)}`,
     `rm -f ${shellQuote(options.watchdogMarkerPath)}`,
+    diagnosticShellFunction,
+    "append_upgrade_event helper-started",
     `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') using ${serviceCommand}"`,
     `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') installed version: $(${serviceCommand} --version 2>&1)"`,
     "for attempt in 1 2 3 4 5; do",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service attempt ${attempt}\"",
+    "  append_upgrade_event restart-service-attempt \"attempt=${attempt}\"",
     `  if ${serviceCommand} restart-service; then`,
     "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service succeeded\"",
+    "    append_upgrade_event restart-service-succeeded \"attempt=${attempt}\"",
     `    ${watchdogCommand}`,
     "    exit 0",
     "  fi",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service failed\"",
+    "  append_upgrade_event restart-service-failed \"attempt=${attempt}\"",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service attempt ${attempt}\"",
+    "  append_upgrade_event install-service-attempt \"attempt=${attempt}\"",
     `  if ${serviceCommand} install-service; then`,
     "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service succeeded\"",
+    "    append_upgrade_event install-service-succeeded \"attempt=${attempt}\"",
     `    ${watchdogCommand}`,
     "    exit 0",
     "  fi",
     "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service failed\"",
+    "  append_upgrade_event install-service-failed \"attempt=${attempt}\"",
     "  sleep 3",
     "done",
     `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere service restart attempts exhausted"`,
+    "append_upgrade_event service-restart-attempts-exhausted",
     `${watchdogCommand} --skip-wait`,
     "exit 1",
+  ].join("\n");
+}
+
+function buildUpgradeDiagnosticShellFunction(options: {
+  nodePath: string;
+  attemptId: string;
+  botId: string;
+  chatId: number;
+  diagnosticJournalPath: string;
+  diagnosticStatePath: string;
+  targetVersionLine: string;
+  watchdogMarkerPath: string;
+  logPath: string;
+}): string {
+  const script = String.raw`
+const fs = require("fs");
+const path = require("path");
+const args = JSON.parse(process.argv[1]);
+const event = process.argv[2] || "helper-event";
+const detail = process.argv[3] || null;
+const entry = {
+  ts: new Date().toISOString(),
+  attemptId: args.attemptId,
+  event,
+  source: "upgrade-helper",
+  botId: args.botId,
+  chatId: args.chatId,
+  targetVersionLine: args.targetVersionLine,
+  watchdogMarkerPath: args.watchdogMarkerPath,
+  logPath: args.logPath,
+};
+if (detail) entry.detail = detail;
+fs.mkdirSync(path.dirname(args.journalPath), { recursive: true });
+fs.appendFileSync(args.journalPath, JSON.stringify(entry) + "\n", { mode: 0o600 });
+fs.chmodSync(args.journalPath, 0o600);
+fs.writeFileSync(args.statePath, JSON.stringify({
+  updatedAt: entry.ts,
+  latest: entry,
+  journalPath: args.journalPath,
+}, null, 2) + "\n", { mode: 0o600 });
+fs.chmodSync(args.statePath, 0o600);
+`;
+  const args = {
+    attemptId: options.attemptId,
+    botId: options.botId,
+    chatId: options.chatId,
+    journalPath: options.diagnosticJournalPath,
+    statePath: options.diagnosticStatePath,
+    targetVersionLine: options.targetVersionLine,
+    watchdogMarkerPath: options.watchdogMarkerPath,
+    logPath: options.logPath,
+  };
+  return [
+    "append_upgrade_event() {",
+    `  ${shellQuote(options.nodePath)} -e ${shellQuote(script)} ${shellQuote(JSON.stringify(args))} "$1" "$2" >/dev/null 2>&1 || true`,
+    "}",
   ].join("\n");
 }
 
@@ -175,6 +260,9 @@ function buildUpgradeWatchdogCommand(options: {
   botId: string;
   chatId: number;
   targetVersionLine: string;
+  upgradeAttemptId: string;
+  diagnosticJournalPath: string;
+  diagnosticStatePath: string;
   watchdogMarkerPath: string;
   watchdogTimeoutSeconds: number;
   logPath: string;
@@ -208,6 +296,34 @@ function tail(filePath, maxChars) {
     return fs.readFileSync(filePath, "utf8").slice(-maxChars).trim();
   } catch {
     return "";
+  }
+}
+
+function appendDiagnostic(event, detail) {
+  try {
+    const entry = {
+      ts: new Date().toISOString(),
+      attemptId: args.attemptId,
+      event,
+      source: "upgrade-watchdog",
+      botId: args.botId,
+      chatId: args.chatId,
+      targetVersionLine: args.targetVersionLine,
+      watchdogMarkerPath: args.markerPath,
+      logPath: args.logPath,
+    };
+    if (detail) entry.detail = detail;
+    fs.mkdirSync(require("path").dirname(args.journalPath), { recursive: true });
+    fs.appendFileSync(args.journalPath, JSON.stringify(entry) + "\n", { mode: 0o600 });
+    fs.chmodSync(args.journalPath, 0o600);
+    fs.writeFileSync(args.diagnosticStatePath, JSON.stringify({
+      updatedAt: entry.ts,
+      latest: entry,
+      journalPath: args.journalPath,
+    }, null, 2) + "\n", { mode: 0o600 });
+    fs.chmodSync(args.diagnosticStatePath, 0o600);
+  } catch (error) {
+    console.error(new Date().toISOString() + " failed to append upgrade diagnostic: " + error.message);
   }
 }
 
@@ -246,11 +362,14 @@ async function waitForMarker() {
   while (!skipWait && Date.now() <= deadline) {
     if (fs.existsSync(args.markerPath)) {
       console.log(new Date().toISOString() + " upgrade watchdog marker observed");
+      appendDiagnostic("watchdog-marker-observed");
       return true;
     }
     await sleep(1000);
   }
-  return fs.existsSync(args.markerPath);
+  const markerExists = fs.existsSync(args.markerPath);
+  appendDiagnostic(markerExists ? "watchdog-marker-observed" : (skipWait ? "watchdog-skip-wait" : "watchdog-timeout"));
+  return markerExists;
 }
 
 async function markExternalFailure() {
@@ -275,10 +394,12 @@ async function markExternalFailure() {
   const config = readJson(args.configPath);
   const token = findBotToken(config, args.botId);
   const logTail = tail(args.logPath, 1200);
+  appendDiagnostic("watchdog-failure-notifying");
   const lines = [
     "<b>Upgrade restart did not become reachable</b>",
     "Installed target: <code>" + esc(args.targetVersionLine) + "</code>.",
     "The supervisor helper did not see a restarted Telegram bridge within " + args.timeoutSeconds + "s.",
+    "Diagnostics: <code>" + esc(args.diagnosticStatePath) + "</code>",
     "Log: <code>" + esc(args.logPath) + "</code>",
   ];
   if (logTail) {
@@ -290,8 +411,10 @@ async function markExternalFailure() {
     parse_mode: "HTML",
   });
   await markExternalFailure();
+  appendDiagnostic("watchdog-failure-sent");
   console.log(new Date().toISOString() + " upgrade watchdog failure notification sent");
 })().catch((error) => {
+  appendDiagnostic("watchdog-error", error.stack || error.message);
   console.error(new Date().toISOString() + " upgrade watchdog failed: " + (error.stack || error.message));
   process.exitCode = 1;
 });
@@ -302,6 +425,9 @@ async function markExternalFailure() {
     botId: options.botId,
     chatId: options.chatId,
     targetVersionLine: options.targetVersionLine,
+    attemptId: options.upgradeAttemptId,
+    journalPath: options.diagnosticJournalPath,
+    diagnosticStatePath: options.diagnosticStatePath,
     markerPath: options.watchdogMarkerPath,
     timeoutSeconds: options.watchdogTimeoutSeconds,
     logPath: options.logPath,

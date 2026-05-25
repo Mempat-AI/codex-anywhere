@@ -1728,8 +1728,10 @@ test("/version reports the installed package version", async () => {
 test("/upgrade installs latest package and schedules a supervised official service restart", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-install-"));
+  const config = testConfig();
   const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
-  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+  const bridge = new CodexAnywhereBridge(config, path.join(tempDir, "config.json"), path.join(tempDir, "state.json"), {
     telegram,
     codex,
     initialState: testState(),
@@ -1744,7 +1746,7 @@ test("/upgrade installs latest package and schedules a supervised official servi
       if (file === process.execPath) {
         return { stdout: "codex-anywhere 0.3.15\n", stderr: "" };
       }
-      return { stdout: "restarted\n", stderr: "" };
+      return { stdout: "scheduled\n", stderr: "" };
     },
   });
 
@@ -1754,18 +1756,18 @@ test("/upgrade installs latest package and schedules a supervised official servi
     {
       file: "npm",
       args: ["install", "-g", "codex-anywhere@latest"],
-      cwd: testConfig().workspaceCwd,
+      cwd: config.workspaceCwd,
     },
   ]);
   assert.deepEqual(execCalls[1], {
     file: "npm",
     args: ["root", "-g"],
-    cwd: testConfig().workspaceCwd,
+    cwd: config.workspaceCwd,
   });
   assert.deepEqual(execCalls[2], {
     file: process.execPath,
     args: ["/opt/homebrew/lib/node_modules/codex-anywhere/dist/cli.js", "--version"],
-    cwd: testConfig().workspaceCwd,
+    cwd: config.workspaceCwd,
   });
   assert.equal(execCalls.length, 4);
   assert.equal(execCalls[3]!.file, "sh");
@@ -1777,10 +1779,14 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.match(restartCommand, /codex-anywhere install-service attempt/);
   assert.match(restartCommand, /codex-anywhere install-service succeeded/);
   assert.match(restartCommand, /upgrade-restart\.log/);
+  assert.match(restartCommand, /upgrade-events\.jsonl/);
+  assert.match(restartCommand, /upgrade-state\.json/);
+  assert.match(restartCommand, /append_upgrade_event helper-started/);
   assert.match(restartCommand, /export PATH=/);
   assert.match(restartCommand, /upgrade-restart-watchdog-/);
   assert.match(restartCommand, /upgrade watchdog marker observed/);
   assert.match(restartCommand, /Upgrade restart did not become reachable/);
+  assert.match(restartCommand, /Diagnostics: (?:<|&lt;)code/);
   assert.doesNotMatch(restartCommand, /test-token/);
   if (process.platform === "darwin") {
     assert.match(restartCommand, /launchctl bootstrap/);
@@ -1796,15 +1802,34 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.doesNotMatch(restartCommand, /\n  if codex-anywhere restart-service/);
   assert.doesNotMatch(restartCommand, /do;/);
   assert.doesNotMatch(restartCommand, /then;/);
-  assert.equal(execCalls[3]!.cwd, testConfig().workspaceCwd);
+  assert.equal(execCalls[3]!.cwd, config.workspaceCwd);
   assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
+  assert.match(telegram.sentMessages[0]!.text, /Diagnostics:/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
   assert.match(telegram.sentMessages[1]!.text, /codex-anywhere 0\.3\.15/);
   assert.match(telegram.sentMessages[1]!.text, /supervised service restart/);
   assert.match(telegram.sentMessages[1]!.text, /automatic completion message/);
   assert.match(telegram.sentMessages[1]!.text, /helper will send a failure message/);
+  assert.match(telegram.sentMessages[1]!.text, /upgrade-state\.json/);
+  assert.match(telegram.sentMessages[1]!.text, /upgrade-events\.jsonl/);
+  assert.match(telegram.sentMessages[1]!.text, /upgrade-restart\.log/);
+  const diagnosticStatePath = path.join(tempDir, "logs", "upgrade-state.json");
+  const diagnosticJournalPath = path.join(tempDir, "logs", "upgrade-events.jsonl");
+  const diagnosticState = JSON.parse(await fs.readFile(diagnosticStatePath, "utf8")) as JsonObject;
+  const latest = diagnosticState.latest as JsonObject;
+  assert.equal(latest.event, "upgrade-helper-scheduled");
+  assert.equal(latest.targetVersionLine, "codex-anywhere 0.3.15");
+  assert.equal(diagnosticState.journalPath, diagnosticJournalPath);
+  const journal = (await fs.readFile(diagnosticJournalPath, "utf8")).trim().split("\n")
+    .map((line) => JSON.parse(line) as JsonObject);
+  assert.deepEqual(journal.map((entry) => entry.event), [
+    "upgrade-started",
+    "upgrade-installed",
+    "upgrade-helper-scheduled",
+  ]);
+  assert.ok(journal.every((entry) => !JSON.stringify(entry).includes("test-token")));
 });
 
 test("startup sends pending upgrade completion from the restarted process", async () => {
@@ -1837,8 +1862,10 @@ test("startup sends pending upgrade completion from the restarted process", asyn
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade completed/);
   assert.match(telegram.sentMessages[0]!.text, /The restarted service reached Telegram successfully/);
+  assert.match(telegram.sentMessages[0]!.text, /Diagnostics:/);
   assert.equal(state.pendingUpgradeNotification, null);
   assert.match(await fs.readFile(markerPath, "utf8"), /^completed /);
+  assert.match(await fs.readFile(path.join(tempDir, "logs", "upgrade-events.jsonl"), "utf8"), /upgrade-completed/);
 });
 
 test("startup reports pending upgrade failure when Codex initialization fails", async () => {
@@ -1878,15 +1905,18 @@ test("startup reports pending upgrade failure when Codex initialization fails", 
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade restart failed/);
   assert.match(telegram.sentMessages[0]!.text, /codex was not found on PATH/);
+  assert.match(telegram.sentMessages[0]!.text, /Diagnostics:/);
   assert.equal(typeof state.pendingUpgradeNotification?.failureNotifiedAt, "number");
   assert.match(await fs.readFile(markerPath, "utf8"), /^startup-failed /);
+  assert.match(await fs.readFile(path.join(tempDir, "logs", "upgrade-events.jsonl"), "utf8"), /upgrade-startup-failed/);
 });
 
 test("/upgrade reports installed CLI verification failures", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-verify-failed-"));
   const execCalls: string[] = [];
-  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+  const bridge = new CodexAnywhereBridge(testConfig(), path.join(tempDir, "config.json"), path.join(tempDir, "state.json"), {
     telegram,
     codex,
     initialState: testState(),
@@ -1912,6 +1942,8 @@ test("/upgrade reports installed CLI verification failures", async () => {
   assert.equal(telegram.sentMessages.length, 2);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade failed/);
   assert.match(telegram.sentMessages[1]!.text, /did not report a valid version/);
+  assert.match(telegram.sentMessages[1]!.text, /Diagnostics:/);
+  assert.match(await fs.readFile(path.join(tempDir, "logs", "upgrade-events.jsonl"), "utf8"), /upgrade-failed/);
 });
 
 test("/upgrade test runs the supervised restart probe without installing", async () => {
