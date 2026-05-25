@@ -54,7 +54,9 @@ export interface ChatSessionState {
   verbose: boolean;
   queueNextArmed: boolean;
   queuedTurnInput: JsonObject[] | null;
+  queuedTurnOriginMessageId: number | null;
   pendingTurnInput: JsonObject[] | null;
+  pendingTurnOriginMessageId: number | null;
   pendingMention: JsonObject | null;
   model: string | null;
   reasoningEffort: string | null;

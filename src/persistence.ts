@@ -26,7 +26,9 @@ export async function loadState(statePath: string): Promise<StoredState> {
     chat.verbose ??= false;
     chat.queueNextArmed ??= false;
     chat.queuedTurnInput ??= null;
+    chat.queuedTurnOriginMessageId ??= null;
     chat.pendingTurnInput ??= null;
+    chat.pendingTurnOriginMessageId ??= null;
     chat.pendingMention ??= null;
     chat.model ??= null;
     chat.reasoningEffort ??= null;

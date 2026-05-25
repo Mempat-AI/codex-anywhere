@@ -163,7 +163,9 @@ function testChatState(overrides: Partial<ChatSessionState> = {}): ChatSessionSt
     verbose: false,
     queueNextArmed: false,
     queuedTurnInput: null,
+    queuedTurnOriginMessageId: null,
     pendingTurnInput: null,
+    pendingTurnOriginMessageId: null,
     pendingMention: null,
     model: null,
     reasoningEffort: null,
@@ -189,11 +191,11 @@ function computerUseInput(task: string): JsonObject[] {
   ];
 }
 
-function telegramMessageUpdate(text: string): TelegramUpdate {
+function telegramMessageUpdate(text: string, messageId = 1): TelegramUpdate {
   return {
-    update_id: 1,
+    update_id: messageId,
     message: {
-      message_id: 1,
+      message_id: messageId,
       chat: { id: 42, type: "private" },
       from: { id: 1 },
       text,
@@ -347,7 +349,7 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.equal(telegram.sentMessages.length, 1);
   assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.match(telegram.sentMessages[0]!.text, /^<b>T<\/b>hinking\n/);
   assert.equal(telegram.editedMessages.length, 1);
   assert.equal(telegram.editedMessages[0]!.messageId, 1);
 
@@ -422,11 +424,13 @@ test("turn card keeps run details above a fresh final answer message", async () 
   });
   const afterToolEdit = telegram.editedMessages.at(-1)!;
   assert.equal(afterToolEdit.messageId, 1);
-  assert.match(afterToolEdit.text, /^Tool: Command completed, exit 0: pnpm test/);
+  assert.match(afterToolEdit.text, /^Command completed, exit 0: pnpm test/);
   assert.match(afterToolEdit.text, /<blockquote expandable>/);
   assert.match(afterToolEdit.text, /Run details/);
-  assert.match(afterToolEdit.text, /Preamble:/);
-  assert.match(afterToolEdit.text, /Tool:/);
+  assert.match(afterToolEdit.text, /I will inspect the Telegram bridge\./);
+  assert.match(afterToolEdit.text, /Command completed, exit 0: pnpm test/);
+  assert.doesNotMatch(afterToolEdit.text, /Preamble:/);
+  assert.doesNotMatch(afterToolEdit.text, /Tool:/);
   await bridge.handleNotificationForTest("item/completed", {
     threadId: "thread-1",
     turnId: "turn-1",
@@ -450,7 +454,7 @@ test("turn card keeps run details above a fresh final answer message", async () 
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /<blockquote expandable>/);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.match(telegram.sentMessages[0]!.text, /^<b>T<\/b>hinking\n/);
   assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
   assert.equal(telegram.sentMessages[1]!.text, "Done.");
@@ -459,12 +463,101 @@ test("turn card keeps run details above a fresh final answer message", async () 
   assert.equal(finalEdit.messageId, 1);
   assert.match(finalEdit.text, /<blockquote expandable>/);
   assert.match(finalEdit.text, /Run details/);
-  assert.match(finalEdit.text, /Preamble:/);
-  assert.match(finalEdit.text, /Tool:/);
+  assert.match(finalEdit.text, /I will inspect the Telegram bridge\./);
+  assert.match(finalEdit.text, /Command completed, exit 0: pnpm test/);
+  assert.doesNotMatch(finalEdit.text, /Preamble:/);
+  assert.doesNotMatch(finalEdit.text, /Tool:/);
   assert.match(finalEdit.text, /pnpm test/);
   assert.doesNotMatch(finalEdit.text, /^Done\./);
   assert.doesNotMatch(finalEdit.text, /Working on:/);
   assert.doesNotMatch(finalEdit.text, /Current:/);
+});
+
+test("queued turn cards reply to the queued Telegram request", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  let startedTurnCount = 0;
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/read") {
+      return {
+        thread: {
+          id: "thread-1",
+          status: { type: "active" },
+          turns: [{ id: "turn-1", status: "inProgress" }],
+        },
+      };
+    }
+    if (method === "thread/resume") {
+      return {};
+    }
+    if (method === "turn/start") {
+      startedTurnCount += 1;
+      return { turn: { id: `turn-${startedTurnCount + 1}` } };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const state = testState();
+  state.chats["42"] = testChatState({
+    threadId: "thread-1",
+    activeTurnId: "turn-1",
+  });
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("queued follow-up", 7));
+  const queueCallbackData = (telegram.sentMessages[0]!.replyMarkup as { inline_keyboard: Array<Array<{ callback_data?: string }>> })
+    .inline_keyboard[0]![1]!.callback_data!;
+  await bridge.handleUpdateForTest(telegramCallbackUpdate(queueCallbackData));
+
+  assert.equal(state.chats["42"]!.queuedTurnOriginMessageId, 7);
+  assert.match(telegram.sentMessages[0]!.text, /queued follow-up/);
+  assert.equal(telegram.sentMessages[0]!.replyToMessageId, 7);
+  assert.match(telegram.sentMessages[1]!.text, /Queued/);
+  assert.equal(telegram.sentMessages[1]!.replyToMessageId, 7);
+
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-2",
+    },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-2",
+    item: {
+      id: "final-2",
+      type: "agentMessage",
+      text: "Queued response.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-2",
+      status: "completed",
+    },
+  });
+
+  const queuedDetailsCard = telegram.sentMessages.find((message) =>
+    message.replyToMessageId === 7 && /Run details/.test(message.text)
+  );
+  const queuedFinalCard = telegram.sentMessages.find((message) =>
+    message.replyToMessageId === 7 && message.text === "Queued response."
+  );
+  assert.ok(queuedDetailsCard);
+  assert.ok(queuedFinalCard);
 });
 
 test("bridge routes /computer through the Computer Use plugin mention", async () => {
@@ -520,7 +613,9 @@ test("bridge queues /computer input through the normal active-turn path", async 
   assert.deepEqual(codex.calls.map((call) => call.method), ["thread/read"]);
   assert.equal(state.chats["42"]!.queueNextArmed, false);
   assert.deepEqual(state.chats["42"]!.queuedTurnInput, computerUseInput("play a music"));
+  assert.equal(state.chats["42"]!.queuedTurnOriginMessageId, 1);
   assert.match(telegram.sentMessages[0]!.text, /Queued/);
+  assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
 });
 
 test("bridge shows /computer usage when task is missing", async () => {

@@ -110,6 +110,8 @@ const COMPUTER_USE_MENTION_TOKEN = "@computer-use";
 const TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024;
 const TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
 const DOWNLOAD_LIST_LIMIT = 50;
+const TURN_STATUS_ANIMATION_INTERVAL_MS = 500;
+const TURN_STATUS_DOT_FRAMES = ["", ".", "..", "..."] as const;
 
 type TelegramClient = Pick<
   TelegramBotApi,
@@ -147,6 +149,7 @@ interface TurnCard {
   detailsMessageId: number | null;
   originMessageId: number | null;
   currentStatus: string;
+  statusAnimationFrame: number;
   finalText: string | null;
   trace: TurnTraceEntry[];
   lastEditAt: number;
@@ -195,6 +198,7 @@ export class CodexAnywhereBridge {
   readonly #pendingChatOrigins = new Map<number, PendingTurnOrigin>();
   readonly #pendingTurnOrigins = new Map<string, PendingTurnOrigin>();
   readonly #turnCards = new Map<string, TurnCard>();
+  readonly #turnCardAnimationIntervals = new Map<string, ReturnType<typeof setInterval>>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
   readonly #hasInitialState: boolean;
   #initialized = false;
@@ -507,12 +511,19 @@ export class CodexAnywhereBridge {
 
     if (state.queueNextArmed) {
       state.queuedTurnInput = preparedInput;
+      state.queuedTurnOriginMessageId = originMessageId;
       state.queueNextArmed = false;
       await this.#saveState();
-      await this.#sendHtmlText(chatId, formatPendingInputActionHtml("queued", preparedInput));
+      await this.#sendHtmlText(
+        chatId,
+        formatPendingInputActionHtml("queued", preparedInput),
+        undefined,
+        originMessageId,
+      );
       return;
     }
     state.pendingTurnInput = preparedInput;
+    state.pendingTurnOriginMessageId = originMessageId;
     await this.#saveState();
     await this.#sendTurnControls(chatId, state.activeTurnId);
   }
@@ -2680,7 +2691,12 @@ export class CodexAnywhereBridge {
         state.turnControlMessageId = null;
       }
     }
-    const message = await this.#sendHtmlText(chatId, text, replyMarkup);
+    const message = await this.#sendHtmlText(
+      chatId,
+      text,
+      replyMarkup,
+      state.pendingTurnOriginMessageId,
+    );
     state.turnControlTurnId = turnId;
     state.turnControlMessageId = message.message_id;
     await this.#saveState();
@@ -2708,7 +2724,9 @@ export class CodexAnywhereBridge {
         return;
       }
       const input = state.pendingTurnInput;
+      const originMessageId = state.pendingTurnOriginMessageId;
       state.pendingTurnInput = null;
+      state.pendingTurnOriginMessageId = null;
       await this.#saveState();
       await this.#clearTurnControls(chatId, parsed.turnId);
       await this.#codex.call("turn/steer", {
@@ -2717,17 +2735,29 @@ export class CodexAnywhereBridge {
         expectedTurnId: state.activeTurnId,
       });
       await this.#telegram.answerCallbackQuery(callbackQueryId, "Steering current turn");
-      await this.#sendHtmlText(chatId, formatPendingInputActionHtml("steered", input));
+      await this.#sendHtmlText(
+        chatId,
+        formatPendingInputActionHtml("steered", input),
+        undefined,
+        originMessageId,
+      );
       return;
     }
     if (parsed.action === "queue") {
       if (state.pendingTurnInput) {
         state.queuedTurnInput = state.pendingTurnInput;
+        state.queuedTurnOriginMessageId = state.pendingTurnOriginMessageId;
         state.pendingTurnInput = null;
+        state.pendingTurnOriginMessageId = null;
         await this.#saveState();
         await this.#clearTurnControls(chatId, parsed.turnId);
         await this.#telegram.answerCallbackQuery(callbackQueryId, "Queued for next turn");
-        await this.#sendHtmlText(chatId, formatPendingInputActionHtml("queued", state.queuedTurnInput));
+        await this.#sendHtmlText(
+          chatId,
+          formatPendingInputActionHtml("queued", state.queuedTurnInput),
+          undefined,
+          state.queuedTurnOriginMessageId,
+        );
         return;
       }
       state.queueNextArmed = true;
@@ -2739,6 +2769,7 @@ export class CodexAnywhereBridge {
     }
     if (parsed.action === "cancel") {
       state.pendingTurnInput = null;
+      state.pendingTurnOriginMessageId = null;
       await this.#saveState();
       await this.#clearTurnControls(chatId, parsed.turnId);
       await this.#telegram.answerCallbackQuery(callbackQueryId, "Cancelled");
@@ -2938,8 +2969,10 @@ export class CodexAnywhereBridge {
       }
       if (!state.queuedTurnInput && state.pendingTurnInput) {
         state.queuedTurnInput = state.pendingTurnInput;
+        state.queuedTurnOriginMessageId = state.pendingTurnOriginMessageId;
       }
       state.pendingTurnInput = null;
+      state.pendingTurnOriginMessageId = null;
       const streams = this.#streamsForTurn(threadId, turnId);
       let lastNonCommentaryMessage: string | null = null;
       for (const stream of streams) {
@@ -2956,7 +2989,9 @@ export class CodexAnywhereBridge {
       this.#stopTypingIndicator(chatId);
       await this.#clearTurnControls(chatId, turnId);
       const queuedTurnInput = state.queuedTurnInput;
+      const queuedTurnOriginMessageId = state.queuedTurnOriginMessageId;
       state.queuedTurnInput = null;
+      state.queuedTurnOriginMessageId = null;
       const status = asString(turn.status) ?? "unknown";
       const error = (turn.error as JsonObject | undefined)?.message;
       const completionHtml = formatTurnCompletionHtml(status, typeof error === "string" ? error : null);
@@ -2969,8 +3004,13 @@ export class CodexAnywhereBridge {
         completionHtml,
       );
       if (queuedTurnInput) {
-        await this.#sendHtmlText(chatId, formatPendingInputActionHtml("starting", queuedTurnInput));
-        await this.#startTurn(chatId, queuedTurnInput);
+        await this.#sendHtmlText(
+          chatId,
+          formatPendingInputActionHtml("starting", queuedTurnInput),
+          undefined,
+          queuedTurnOriginMessageId,
+        );
+        await this.#startTurn(chatId, queuedTurnInput, undefined, queuedTurnOriginMessageId);
       }
       return;
     }
@@ -3468,13 +3508,13 @@ export class CodexAnywhereBridge {
     );
 
     if (stream.phase === "commentary") {
-      card.currentStatus = latestStatusLine(raw) ?? "Thinking";
+      this.#setTurnCardStatus(card, latestStatusLine(raw) ?? "Thinking");
       if (force && raw.trim()) {
         this.#addTurnTrace(card, "Preamble", raw.trim());
       }
       await this.#flushTurnCard(card, { force });
     } else {
-      card.currentStatus = "Writing final answer";
+      this.#setTurnCardStatus(card, "Writing final answer");
       card.finalText = raw;
       await this.#flushTurnCard(card, { force });
     }
@@ -3506,6 +3546,7 @@ export class CodexAnywhereBridge {
     chatId: number,
     text: string,
     replyMarkup?: JsonObject,
+    replyToMessageId?: number | null,
   ): Promise<{ message_id: number }> {
     const chunks = splitTelegramChunks(text);
     let last!: { message_id: number };
@@ -3515,6 +3556,7 @@ export class CodexAnywhereBridge {
         chunk,
         i === chunks.length - 1 ? replyMarkup : undefined,
         "HTML",
+        i === 0 ? replyToMessageId : undefined,
       );
     }
     return last;
@@ -3535,6 +3577,7 @@ export class CodexAnywhereBridge {
       detailsMessageId: null,
       originMessageId: origin?.originMessageId ?? null,
       currentStatus: "Thinking",
+      statusAnimationFrame: 0,
       finalText: null,
       trace: [],
       lastEditAt: 0,
@@ -3543,6 +3586,7 @@ export class CodexAnywhereBridge {
     };
     this.#turnCards.set(key, card);
     await this.#flushTurnCard(card, { force: true });
+    this.#startTurnCardAnimation(card);
     return card;
   }
 
@@ -3553,7 +3597,7 @@ export class CodexAnywhereBridge {
     status: string,
   ): Promise<void> {
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
-    card.currentStatus = status;
+    this.#setTurnCardStatus(card, status);
     await this.#flushTurnCard(card, { force: true });
   }
 
@@ -3566,8 +3610,56 @@ export class CodexAnywhereBridge {
   ): Promise<void> {
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
     this.#addTurnTrace(card, label, text);
-    card.currentStatus = compactTraceLine(label, text);
+    this.#setTurnCardStatus(card, compactTraceLine(text));
     await this.#flushTurnCard(card, { force: true });
+  }
+
+  #setTurnCardStatus(card: TurnCard, status: string): void {
+    if (card.currentStatus !== status) {
+      card.currentStatus = status;
+      card.statusAnimationFrame = 0;
+    }
+    if (isAnimatedTurnStatus(status) && !card.finalized) {
+      this.#startTurnCardAnimation(card);
+    } else {
+      this.#stopTurnCardAnimation(turnKey(card.threadId, card.turnId));
+    }
+  }
+
+  #startTurnCardAnimation(card: TurnCard): void {
+    const key = turnKey(card.threadId, card.turnId);
+    if (this.#turnCardAnimationIntervals.has(key)) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      void this.#advanceTurnCardAnimation(key).catch((error) => {
+        this.#logRuntimeError("animate turn card", error);
+      });
+    }, TURN_STATUS_ANIMATION_INTERVAL_MS);
+    interval.unref?.();
+    this.#turnCardAnimationIntervals.set(key, interval);
+  }
+
+  async #advanceTurnCardAnimation(key: string): Promise<void> {
+    const card = this.#turnCards.get(key);
+    if (!card || card.finalized || !isAnimatedTurnStatus(card.currentStatus)) {
+      this.#stopTurnCardAnimation(key);
+      return;
+    }
+
+    card.statusAnimationFrame =
+      card.statusAnimationFrame >= Number.MAX_SAFE_INTEGER ? 0 : card.statusAnimationFrame + 1;
+    await this.#flushTurnCard(card, { force: true });
+  }
+
+  #stopTurnCardAnimation(key: string): void {
+    const interval = this.#turnCardAnimationIntervals.get(key);
+    if (!interval) {
+      return;
+    }
+    clearInterval(interval);
+    this.#turnCardAnimationIntervals.delete(key);
   }
 
   #addTurnTrace(card: TurnCard, label: string, text: string): void {
@@ -3600,12 +3692,14 @@ export class CodexAnywhereBridge {
         this.#addTurnTrace(card, "Status", stripTelegramHtml(fallbackHtml));
       }
     }
-    card.currentStatus = status === "completed" ? "Done" : `Turn ${status}`;
+    this.#setTurnCardStatus(card, status === "completed" ? "Done" : `Turn ${status}`);
     card.finalized = true;
     await this.#flushTurnCard(card, { force: true });
     this.#pendingTurnOrigins.delete(turnKey(threadId, turnId));
     this.#pendingChatOrigins.delete(chatId);
-    this.#turnCards.delete(turnKey(threadId, turnId));
+    const key = turnKey(threadId, turnId);
+    this.#stopTurnCardAnimation(key);
+    this.#turnCards.delete(key);
   }
 
   async #flushTurnCard(card: TurnCard, options: { force: boolean }): Promise<void> {
@@ -4169,7 +4263,9 @@ export class CodexAnywhereBridge {
         verbose: false,
         queueNextArmed: false,
         queuedTurnInput: null,
+        queuedTurnOriginMessageId: null,
         pendingTurnInput: null,
+        pendingTurnOriginMessageId: null,
         pendingMention: null,
         model: null,
         reasoningEffort: null,
@@ -4206,7 +4302,9 @@ export class CodexAnywhereBridge {
     state.turnControlMessageId = null;
     state.queueNextArmed = false;
     state.queuedTurnInput = null;
+    state.queuedTurnOriginMessageId = null;
     state.pendingTurnInput = null;
+    state.pendingTurnOriginMessageId = null;
     state.pendingMention = null;
     state.lastAssistantMessage = null;
   }
@@ -4348,10 +4446,10 @@ function renderTurnTraceHtml(trace: TurnTraceEntry[]): string {
   if (trace.length === 0) {
     lines.push("", "Waiting for activity.");
   } else {
-    for (const [index, entry] of trace.entries()) {
+    for (const entry of trace) {
       lines.push(
         "",
-        `${index + 1}. ${entry.label}: ${truncateMultiline(entry.text, 700)}`,
+        truncateMultiline(entry.text, 700),
       );
     }
   }
@@ -4363,10 +4461,42 @@ function renderTurnDetailsCardHtml(card: TurnCard): string {
     return renderTurnTraceHtml(card.trace);
   }
   return [
-    escapeTelegramHtml(truncatePlain(card.currentStatus, 1400)),
+    renderTurnStatusHtml(card),
     "",
     renderTurnTraceHtml(card.trace),
   ].join("\n");
+}
+
+function renderTurnStatusHtml(card: TurnCard): string {
+  const status = truncatePlain(card.currentStatus, 1400);
+  if (!isAnimatedTurnStatus(card.currentStatus)) {
+    return escapeTelegramHtml(status);
+  }
+  const frame = TURN_STATUS_DOT_FRAMES[card.statusAnimationFrame % TURN_STATUS_DOT_FRAMES.length] ?? "";
+  const suffix = frame ? ` ${frame}` : "";
+  return `${renderSweepingBoldHtml(status, card.statusAnimationFrame)}${escapeTelegramHtml(suffix)}`;
+}
+
+function isAnimatedTurnStatus(status: string): boolean {
+  return status === "Thinking" || status === "Writing final answer";
+}
+
+function renderSweepingBoldHtml(text: string, frame: number): string {
+  const chars = Array.from(text);
+  const boldableIndexes = chars
+    .map((char, index) => ({ char, index }))
+    .filter(({ char }) => !/\s/.test(char))
+    .map(({ index }) => index);
+  const boldIndex = boldableIndexes[frame % boldableIndexes.length];
+  if (boldIndex === undefined) {
+    return escapeTelegramHtml(text);
+  }
+  return chars
+    .map((char, index) => {
+      const escaped = escapeTelegramHtml(char);
+      return index === boldIndex ? `<b>${escaped}</b>` : escaped;
+    })
+    .join("");
 }
 
 function buildTurnFinalHtmlChunks(card: TurnCard): string[] {
@@ -4383,9 +4513,9 @@ function latestStatusLine(text: string): string | null {
   return line ? truncatePlain(line.replace(/\s+/g, " "), 180) : null;
 }
 
-function compactTraceLine(label: string, text: string): string {
+function compactTraceLine(text: string): string {
   const line = latestStatusLine(text) ?? text.trim();
-  return `${label}: ${truncatePlain(line, 160)}`;
+  return truncatePlain(line, 160);
 }
 
 function summarizeCommandTrace(item: JsonObject, verbose: boolean): string {
