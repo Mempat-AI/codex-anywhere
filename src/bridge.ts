@@ -115,6 +115,8 @@ const TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024;
 const TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
 const DOWNLOAD_LIST_LIMIT = 50;
 const TURN_STATUS_ANIMATION_INTERVAL_MS = 500;
+const TURN_STATUS_ANIMATION_EDIT_DELAYS_MS = [500, 1000, 1500, 2000] as const;
+const TURN_STATUS_BOLD_STEP = 3;
 const TURN_STATUS_DOT_FRAMES = ["", ".", "..", "..."] as const;
 
 type TelegramClient = Pick<
@@ -157,6 +159,8 @@ interface TurnCard {
   finalText: string | null;
   trace: TurnTraceEntry[];
   lastEditAt: number;
+  flushInFlight: Promise<void> | null;
+  animationBackoffUntil: number;
   finalized: boolean;
   finalSent: boolean;
 }
@@ -3800,6 +3804,8 @@ export class CodexAnywhereBridge {
       finalText: null,
       trace: [],
       lastEditAt: 0,
+      flushInFlight: null,
+      animationBackoffUntil: 0,
       finalized: false,
       finalSent: false,
     };
@@ -3866,10 +3872,18 @@ export class CodexAnywhereBridge {
       this.#stopTurnCardAnimation(key);
       return;
     }
+    const now = Date.now();
+    if (
+      card.flushInFlight
+      || now < card.animationBackoffUntil
+      || now - card.lastEditAt < turnStatusAnimationEditDelayMs(card)
+    ) {
+      return;
+    }
 
     card.statusAnimationFrame =
       card.statusAnimationFrame >= Number.MAX_SAFE_INTEGER ? 0 : card.statusAnimationFrame + 1;
-    await this.#flushTurnCard(card, { force: true });
+    await this.#flushTurnCard(card, { force: true, animation: true });
   }
 
   #stopTurnCardAnimation(key: string): void {
@@ -3942,7 +3956,47 @@ export class CodexAnywhereBridge {
     }
   }
 
-  async #flushTurnCard(card: TurnCard, options: { force: boolean }): Promise<void> {
+  async #flushTurnCard(card: TurnCard, options: { force: boolean; animation?: boolean }): Promise<void> {
+    if (options.animation && card.flushInFlight) {
+      return;
+    }
+
+    const previousFlush = card.flushInFlight;
+    const flush = (async () => {
+      if (previousFlush) {
+        await previousFlush.catch(() => undefined);
+      }
+      if (options.animation && Date.now() < card.animationBackoffUntil) {
+        return;
+      }
+      try {
+        await this.#flushTurnCardNow(card, options);
+      } catch (error) {
+        const retryAfterMs = telegramRetryAfterMs(error);
+        if (retryAfterMs !== null) {
+          card.animationBackoffUntil = Date.now() + retryAfterMs;
+          if (options.animation) {
+            this.#logRuntimeError(
+              "animate turn card",
+              new Error(`Telegram rate limited turn-card animation; pausing for ${Math.ceil(retryAfterMs / 1000)}s`),
+            );
+            return;
+          }
+        }
+        throw error;
+      }
+    })();
+    card.flushInFlight = flush;
+    try {
+      await flush;
+    } finally {
+      if (card.flushInFlight === flush) {
+        card.flushInFlight = null;
+      }
+    }
+  }
+
+  async #flushTurnCardNow(card: TurnCard, options: { force: boolean; animation?: boolean }): Promise<void> {
     const now = Date.now();
     if (!options.force && now - card.lastEditAt < this.#config.streamEditIntervalMs) {
       return;
@@ -3959,7 +4013,14 @@ export class CodexAnywhereBridge {
       );
       card.detailsMessageId = message.message_id;
     } else {
-      await this.#telegram.editMessageText(card.chatId, card.detailsMessageId, detailsHtml, undefined, "HTML");
+      await this.#telegram.editMessageText(
+        card.chatId,
+        card.detailsMessageId,
+        detailsHtml,
+        undefined,
+        "HTML",
+        { retry: !options.animation },
+      );
     }
 
     if (card.finalized && !card.finalSent) {
@@ -4727,13 +4788,19 @@ function isAnimatedTurnStatus(status: string): boolean {
   return status === "Thinking" || status === "Writing final answer";
 }
 
+function turnStatusAnimationEditDelayMs(card: TurnCard): number {
+  return TURN_STATUS_ANIMATION_EDIT_DELAYS_MS[
+    card.statusAnimationFrame % TURN_STATUS_ANIMATION_EDIT_DELAYS_MS.length
+  ] ?? TURN_STATUS_ANIMATION_EDIT_DELAYS_MS[0];
+}
+
 function renderSweepingBoldHtml(text: string, frame: number): string {
   const chars = Array.from(text);
   const boldableIndexes = chars
     .map((char, index) => ({ char, index }))
     .filter(({ char }) => !/\s/.test(char))
     .map(({ index }) => index);
-  const boldIndex = boldableIndexes[frame % boldableIndexes.length];
+  const boldIndex = boldableIndexes[(frame * TURN_STATUS_BOLD_STEP) % boldableIndexes.length];
   if (boldIndex === undefined) {
     return escapeTelegramHtml(text);
   }
@@ -5325,6 +5392,22 @@ function formatBytes(bytes: number): string {
     value /= 1024;
   }
   return `${bytes} B`;
+}
+
+function telegramRetryAfterMs(error: unknown): number | null {
+  const retryAfterSeconds = (error as { retryAfterSeconds?: unknown } | null)?.retryAfterSeconds;
+  if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.ceil(retryAfterSeconds * 1000);
+  }
+  if (!(error instanceof Error)) {
+    return null;
+  }
+  const match = /\bretry after\s+(\d+)\b/i.exec(error.message);
+  if (!match) {
+    return null;
+  }
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
 }
 
 function isLikelyImagePath(filePath: string): boolean {

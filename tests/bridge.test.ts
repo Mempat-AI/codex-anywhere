@@ -117,6 +117,26 @@ class DelayedEditTelegram extends FakeTelegram {
   }
 }
 
+class RateLimitedEditTelegram extends FakeTelegram {
+  failNextEdit = false;
+  editAttempts = 0;
+
+  override async editMessageText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    replyMarkup?: JsonObject,
+    parseMode?: string,
+  ): Promise<void> {
+    this.editAttempts += 1;
+    if (this.failNextEdit) {
+      this.failNextEdit = false;
+      throw new Error("Too Many Requests: retry after 5");
+    }
+    await super.editMessageText(chatId, messageId, text, replyMarkup, parseMode);
+  }
+}
+
 class FakeCodex {
   readonly calls: Array<{ method: string; params?: JsonObject }> = [];
 
@@ -268,12 +288,12 @@ function telegramCallbackUpdate(data: string): TelegramUpdate {
 const serialTest = { concurrency: false } as const;
 const runOmxCommandTest = process.env.SKIP_OMX_COMMAND_TESTS === "1" ? test.skip : test;
 
-async function waitForCondition(condition: () => boolean): Promise<void> {
-  for (let i = 0; i < 50; i += 1) {
+async function waitForCondition(condition: () => boolean, attempts = 50, delayMs = 10): Promise<void> {
+  for (let i = 0; i < attempts; i += 1) {
     if (condition()) {
       return;
     }
-    await sleep(10);
+    await sleep(delayMs);
   }
   assert.fail("condition was not met in time");
 }
@@ -452,7 +472,6 @@ test("overlapping final card flushes reserve the final response before sending",
       status: "completed",
     },
   });
-  await waitForCondition(() => telegram.editWaiters.length >= 2);
 
   telegram.delayEdits = false;
   telegram.releaseEdits();
@@ -461,6 +480,33 @@ test("overlapping final card flushes reserve the final response before sending",
   const finalMessages = telegram.sentMessages.filter((message) => message.text === "Race final.");
   assert.equal(finalMessages.length, 1);
   assert.equal(finalMessages[0]!.replyToMessageId, 1);
+});
+
+test("turn card animation backs off after Telegram rate limits", { concurrency: false }, async () => {
+  const telegram = new RateLimitedEditTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("hello"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-1",
+    },
+  });
+
+  const setupEditAttempts = telegram.editAttempts;
+  telegram.failNextEdit = true;
+  await waitForCondition(() => telegram.editAttempts === setupEditAttempts + 1, 100, 50);
+
+  assert.equal(telegram.editAttempts, setupEditAttempts + 1);
+
+  await sleep(1000);
+  assert.equal(telegram.editAttempts, setupEditAttempts + 1);
 });
 
 test("turn card keeps run details above a fresh final answer message", async () => {

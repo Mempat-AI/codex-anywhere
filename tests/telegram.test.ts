@@ -34,6 +34,60 @@ test("sendMessage can reply to the source Telegram message", async () => {
   }
 });
 
+test("sendMessage retries once after Telegram retry_after", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return Response.json(
+        {
+          ok: false,
+          description: "Too Many Requests: retry after 0.01",
+          parameters: { retry_after: 0.01 },
+        },
+        { status: 429 },
+      );
+    }
+    return Response.json({ ok: true, result: { message_id: 10 } });
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    const result = await api.sendMessage(42, "working");
+
+    assert.equal(result.message_id, 10);
+    assert.equal(calls, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("editMessageText can skip blocking retry for animation updates", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json(
+      {
+        ok: false,
+        description: "Too Many Requests: retry after 5",
+        parameters: { retry_after: 5 },
+      },
+      { status: 429 },
+    );
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    await assert.rejects(
+      api.editMessageText(42, 1, "Thinking", undefined, "HTML", { retry: false }),
+      /Too Many Requests/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("sendDocument uploads a local file with Telegram multipart form-data", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-telegram-upload-"));
   const filePath = path.join(tempDir, "report.txt");
