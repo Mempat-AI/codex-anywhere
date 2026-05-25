@@ -272,6 +272,10 @@ export class CodexAnywhereBridge {
     await this.#handleUpdate(update);
   }
 
+  async handlePolledUpdateForTest(update: TelegramUpdate): Promise<void> {
+    await this.#handlePolledUpdate(update);
+  }
+
   async handleNotificationForTest(method: string, params: JsonObject): Promise<void> {
     await this.#handleNotification(method, params);
   }
@@ -282,15 +286,19 @@ export class CodexAnywhereBridge {
         const offset = this.#state.lastUpdateId === null ? null : this.#state.lastUpdateId + 1;
         const updates = await this.#telegram.getUpdates(offset, this.#config.pollTimeoutSeconds);
         for (const update of updates) {
-          this.#state.lastUpdateId = update.update_id;
-          await this.#saveState();
-          await this.#handleUpdate(update);
+          await this.#handlePolledUpdate(update);
         }
       } catch (error) {
         this.#logRuntimeError("telegram poll", error);
         await sleep(1000);
       }
     }
+  }
+
+  async #handlePolledUpdate(update: TelegramUpdate): Promise<void> {
+    await this.#handleUpdate(update);
+    this.#state.lastUpdateId = update.update_id;
+    await this.#saveState();
   }
 
   async #consumeCodexLoop(): Promise<void> {

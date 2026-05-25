@@ -560,6 +560,37 @@ test("queued turn cards reply to the queued Telegram request", async () => {
   assert.ok(queuedFinalCard);
 });
 
+test("polled updates are acknowledged only after handling succeeds", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-polled-update-"));
+  const state = testState();
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    throw new Error(`boom during ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(
+    testConfig(),
+    path.join(tempDir, "config.json"),
+    path.join(tempDir, "state.json"),
+    {
+      telegram,
+      codex,
+      initialState: state,
+    },
+  );
+
+  await assert.rejects(
+    bridge.handlePolledUpdateForTest(telegramMessageUpdate("start a failing turn", 10)),
+    /boom during thread\/start/,
+  );
+  assert.equal(state.lastUpdateId, null);
+
+  await bridge.handlePolledUpdateForTest(telegramMessageUpdate("/version", 11));
+  assert.equal(state.lastUpdateId, 11);
+  assert.match(telegram.sentMessages.at(-1)?.text ?? "", /^codex-anywhere /);
+});
+
 test("bridge routes /computer through the Computer Use plugin mention", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
