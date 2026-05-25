@@ -390,9 +390,7 @@ async function installLaunchAgent(
   spec: LaunchAgentSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(spec.plistPath), { recursive: true });
-  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
-  await fs.writeFile(spec.plistPath, renderLaunchAgentPlist(spec), "utf8");
+  await writeLaunchAgentPlist(spec);
   await runLaunchctl(execFile, ["enable", spec.serviceTarget], { ignoreFailure: true });
   await runLaunchctl(execFile, ["bootout", spec.domainTarget, spec.plistPath], {
     ignoreFailure: true,
@@ -427,6 +425,7 @@ async function restartLaunchAgent(
   spec: LaunchAgentSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
+  await writeLaunchAgentPlist(spec);
   await runLaunchctl(execFile, ["enable", spec.serviceTarget], { ignoreFailure: true });
   await runLaunchctl(execFile, ["bootout", spec.domainTarget, spec.plistPath], {
     ignoreFailure: true,
@@ -488,9 +487,7 @@ async function installLinuxSystemdUnit(
   spec: LinuxSystemdServiceSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(spec.unitPath), { recursive: true });
-  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
-  await fs.writeFile(spec.unitPath, renderLinuxSystemdUnit(spec), "utf8");
+  await writeLinuxSystemdUnit(spec);
   await runSystemctl(execFile, ["--user", "daemon-reload"]);
   await runSystemctl(execFile, ["--user", "enable", "--now", spec.serviceName]);
 }
@@ -516,9 +513,22 @@ async function restartLinuxSystemdUnit(
   spec: LinuxSystemdServiceSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
+  await writeLinuxSystemdUnit(spec);
   await runSystemctl(execFile, ["--user", "daemon-reload"]);
   await runSystemctl(execFile, ["--user", "enable", spec.serviceName]);
   await runSystemctl(execFile, ["--user", "restart", spec.serviceName]);
+}
+
+async function writeLaunchAgentPlist(spec: LaunchAgentSpec): Promise<void> {
+  await fs.mkdir(path.dirname(spec.plistPath), { recursive: true });
+  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
+  await fs.writeFile(spec.plistPath, renderLaunchAgentPlist(spec), "utf8");
+}
+
+async function writeLinuxSystemdUnit(spec: LinuxSystemdServiceSpec): Promise<void> {
+  await fs.mkdir(path.dirname(spec.unitPath), { recursive: true });
+  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
+  await fs.writeFile(spec.unitPath, renderLinuxSystemdUnit(spec), "utf8");
 }
 
 async function uninstallLinuxSystemdUnit(

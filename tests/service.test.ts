@@ -301,6 +301,7 @@ test("restart-service on macOS reboots the existing LaunchAgent", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-service-restart-"));
   const homeDir = path.join(tempDir, "home");
   const repoDir = path.join(tempDir, "repo");
+  const oldRepoDir = path.join(tempDir, "old-repo");
   const storageRoot = path.join(tempDir, "storage");
   const storagePaths = {
     configPath: path.join(storageRoot, "config.json"),
@@ -318,7 +319,20 @@ test("restart-service on macOS reboots the existing LaunchAgent", async () => {
     pathEnv: "/opt/homebrew/bin:/usr/bin:/bin",
     programArguments: ["/opt/homebrew/bin/node", path.join(repoDir, "dist", "cli.js"), "connect"],
   });
-  await fs.writeFile(spec.plistPath, renderLaunchAgentPlist(spec), "utf8");
+  const staleSpec = buildMacosLaunchAgentSpec({
+    repoCwd: oldRepoDir,
+    storageRoot,
+    homeDir,
+    uid: 501,
+    pathEnv: "/opt/homebrew/bin:/usr/bin:/bin",
+    programArguments: [
+      "/opt/homebrew/bin/node",
+      path.join(oldRepoDir, "node_modules", "tsx", "dist", "cli.mjs"),
+      path.join(oldRepoDir, "src", "cli.ts"),
+      "connect",
+    ],
+  });
+  await fs.writeFile(staleSpec.plistPath, renderLaunchAgentPlist(staleSpec), "utf8");
 
   const launchctlCalls: string[][] = [];
   const savedLogs: string[] = [];
@@ -360,7 +374,89 @@ test("restart-service on macOS reboots the existing LaunchAgent", async () => {
     ["bootstrap", spec.domainTarget, spec.plistPath],
     ["kickstart", "-k", spec.serviceTarget],
   ]);
+  const refreshedPlist = await fs.readFile(spec.plistPath, "utf8");
+  assert.equal(refreshedPlist.includes(path.join(repoDir, "dist", "cli.js")), true);
+  assert.doesNotMatch(refreshedPlist, /src\/cli\.ts/);
   assert.match(savedLogs.join("\n"), /Restarted LaunchAgent/);
+});
+
+test("restart-service on linux rewrites a stale user unit before restarting", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-service-restart-linux-"));
+  const homeDir = path.join(tempDir, "home");
+  const repoDir = path.join(tempDir, "repo");
+  const oldRepoDir = path.join(tempDir, "old-repo");
+  const storageRoot = path.join(tempDir, "storage");
+  const storagePaths = {
+    configPath: path.join(storageRoot, "config.json"),
+    statePath: path.join(storageRoot, "state.json"),
+  };
+  await fs.mkdir(path.join(repoDir, "dist"), { recursive: true });
+  await fs.writeFile(path.join(repoDir, "dist", "cli.js"), "// dist\n", "utf8");
+
+  const spec = buildLinuxSystemdUserServiceSpec({
+    repoCwd: repoDir,
+    storageRoot,
+    homeDir,
+    pathEnv: "/usr/local/bin:/usr/bin:/bin",
+    programArguments: ["/usr/bin/node", path.join(repoDir, "dist", "cli.js"), "connect"],
+  });
+  const staleSpec = buildLinuxSystemdUserServiceSpec({
+    repoCwd: oldRepoDir,
+    storageRoot,
+    homeDir,
+    pathEnv: "/usr/local/bin:/usr/bin:/bin",
+    programArguments: [
+      "/usr/bin/node",
+      path.join(oldRepoDir, "node_modules", "tsx", "dist", "cli.mjs"),
+      path.join(oldRepoDir, "src", "cli.ts"),
+      "connect",
+    ],
+  });
+  await fs.mkdir(path.dirname(staleSpec.unitPath), { recursive: true });
+  await fs.writeFile(staleSpec.unitPath, renderLinuxSystemdUnit(staleSpec), "utf8");
+
+  const systemctlCalls: string[][] = [];
+  const savedLogs: string[] = [];
+
+  await runBackgroundServiceCommand("restart-service", {
+    cwd: repoDir,
+    env: {
+      PATH: "/usr/local/bin:/usr/bin:/bin",
+      HOME: homeDir,
+      USER: "alice",
+    },
+    platform: "linux",
+    packageRoot: repoDir,
+    homeDir,
+    storagePaths,
+    nodePath: "/usr/bin/node",
+    loadConfig: async () => ({
+      version: 1,
+      telegramBotToken: "token",
+      workspaceCwd: "/home/alice/workspace",
+      ownerUserId: null,
+      pollTimeoutSeconds: 20,
+      streamEditIntervalMs: 1500,
+    }),
+    execFile: async (file, args) => {
+      assert.equal(file, "systemctl");
+      systemctlCalls.push(args);
+      return { stdout: "", stderr: "" };
+    },
+    log: (message) => {
+      savedLogs.push(message);
+    },
+  });
+
+  assert.deepEqual(systemctlCalls, [
+    ["--user", "daemon-reload"],
+    ["--user", "enable", spec.serviceName],
+    ["--user", "restart", spec.serviceName],
+  ]);
+  const refreshedUnit = await fs.readFile(spec.unitPath, "utf8");
+  assert.equal(refreshedUnit.includes(path.join(repoDir, "dist", "cli.js")), true);
+  assert.doesNotMatch(refreshedUnit, /src\/cli\.ts/);
+  assert.match(savedLogs.join("\n"), /Restarted systemd user service/);
 });
 
 test("service-status lists configured multi-bot definitions", async () => {

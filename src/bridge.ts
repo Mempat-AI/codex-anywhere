@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -3233,13 +3233,16 @@ export class CodexAnywhereBridge {
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
           `Verified <code>${escapeTelegramHtml(installedCli.versionLine)}</code>.`,
-          "Scheduling a detached service restart from the official package now. Send /version after a few seconds to confirm.",
+          "Scheduling a supervised service restart from the official package now. Send /version after a few seconds to confirm.",
         ].join("\n"),
       );
       await this.#execFile("sh", ["-c", buildDetachedServiceRestartCommand({
         nodePath: installedCli.nodePath,
         cliPath: installedCli.cliPath,
         storageRoot: path.dirname(this.#configPath),
+        platform: process.platform,
+        homeDir: os.homedir(),
+        uid: typeof process.getuid === "function" ? process.getuid() : undefined,
       })], {
         cwd: this.#config.workspaceCwd,
         env: process.env,
@@ -5072,11 +5075,46 @@ function buildDetachedServiceRestartCommand(options: {
   nodePath: string;
   cliPath: string;
   storageRoot: string;
+  platform?: NodeJS.Platform;
+  homeDir?: string;
+  uid?: number;
 }): string {
   const logDir = path.join(options.storageRoot, "logs");
   const logPath = path.join(logDir, "upgrade-restart.log");
   const serviceCommand = `${shellQuote(options.nodePath)} ${shellQuote(options.cliPath)}`;
-  const script = [
+  const script = buildUpgradeRestartScript({
+    serviceCommand,
+    storageRoot: options.storageRoot,
+    logPath,
+  });
+  if (options.platform === "darwin") {
+    return buildMacosUpgradeRestartCommand({
+      script,
+      logDir,
+      logPath,
+      storageRoot: options.storageRoot,
+      homeDir: options.homeDir ?? os.homedir(),
+      uid: options.uid,
+    });
+  }
+  if (options.platform === "linux") {
+    return buildLinuxUpgradeRestartCommand({
+      script,
+      logDir,
+      storageRoot: options.storageRoot,
+    });
+  }
+  return buildNohupUpgradeRestartCommand({ script, logDir });
+}
+
+function buildUpgradeRestartScript(options: {
+  serviceCommand: string;
+  storageRoot: string;
+  logPath: string;
+}): string {
+  const { serviceCommand } = options;
+  return [
+    `exec >>${shellQuote(options.logPath)} 2>&1`,
     "sleep 3",
     `export CODEX_ANYWHERE_HOME=${shellQuote(options.storageRoot)}`,
     `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') using ${serviceCommand}"`,
@@ -5098,7 +5136,103 @@ function buildDetachedServiceRestartCommand(options: {
     "done",
     "exit 1",
   ].join("\n");
-  return `mkdir -p ${shellQuote(logDir)} && nohup sh -c ${shellQuote(script)} >${shellQuote(logPath)} 2>&1 &`;
+}
+
+function buildMacosUpgradeRestartCommand(options: {
+  script: string;
+  logDir: string;
+  logPath: string;
+  storageRoot: string;
+  homeDir: string;
+  uid?: number;
+}): string {
+  if (options.uid === undefined) {
+    return buildNohupUpgradeRestartCommand({ script: options.script, logDir: options.logDir });
+  }
+  const helperId = createHash("sha256").update(options.storageRoot).digest("hex").slice(0, 12);
+  const label = `ai.mempat.codex-anywhere.upgrade-restart.${helperId}`;
+  const domainTarget = `gui/${options.uid}`;
+  const serviceTarget = `${domainTarget}/${label}`;
+  const plistPath = path.join(options.homeDir, "Library", "LaunchAgents", `${label}.plist`);
+  const plist = renderUpgradeLaunchAgentPlist({
+    label,
+    script: options.script,
+    logPath: options.logPath,
+  });
+  return [
+    `mkdir -p ${shellQuote(options.logDir)} ${shellQuote(path.dirname(plistPath))}`,
+    `printf %s ${shellQuote(plist)} >${shellQuote(plistPath)}`,
+    `(launchctl bootout ${shellQuote(domainTarget)} ${shellQuote(plistPath)} >/dev/null 2>&1 || true)`,
+    `launchctl bootstrap ${shellQuote(domainTarget)} ${shellQuote(plistPath)}`,
+    `launchctl kickstart -k ${shellQuote(serviceTarget)}`,
+  ].join(" && ");
+}
+
+function renderUpgradeLaunchAgentPlist(options: {
+  label: string;
+  script: string;
+  logPath: string;
+}): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${escapeXml(options.label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>${escapeXml(options.script)}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>${escapeXml(options.logPath)}</string>
+  <key>StandardErrorPath</key>
+  <string>${escapeXml(options.logPath)}</string>
+</dict>
+</plist>
+`;
+}
+
+function buildLinuxUpgradeRestartCommand(options: {
+  script: string;
+  logDir: string;
+  storageRoot: string;
+}): string {
+  const unitId = createHash("sha256").update(options.storageRoot).digest("hex").slice(0, 12);
+  const unitName = `codex-anywhere-upgrade-restart-${unitId}`;
+  const systemdScript = [
+    `systemctl --user stop ${shellQuote(`${unitName}.service`)} >/dev/null 2>&1 || true`,
+    `systemctl --user reset-failed ${shellQuote(`${unitName}.service`)} >/dev/null 2>&1 || true`,
+    `systemd-run --user --unit=${shellQuote(unitName)} --collect /bin/sh -c ${shellQuote(options.script)}`,
+  ].join("\n");
+  const fallbackScript = `nohup sh -c ${shellQuote(options.script)} >/dev/null 2>&1 &`;
+  return [
+    `mkdir -p ${shellQuote(options.logDir)}`,
+    "if command -v systemd-run >/dev/null 2>&1; then",
+    systemdScript,
+    "else",
+    fallbackScript,
+    "fi",
+  ].join("\n");
+}
+
+function buildNohupUpgradeRestartCommand(options: {
+  script: string;
+  logDir: string;
+}): string {
+  return `mkdir -p ${shellQuote(options.logDir)} && nohup sh -c ${shellQuote(options.script)} >/dev/null 2>&1 &`;
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
 }
 
 function shellQuote(value: string): string {

@@ -1581,7 +1581,7 @@ test("/version reports the installed package version", async () => {
   assert.match(telegram.sentMessages[0]!.text, /^codex-anywhere \d+\.\d+\.\d+/);
 });
 
-test("/upgrade installs latest package and schedules a detached official service restart", async () => {
+test("/upgrade installs latest package and schedules a supervised official service restart", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
@@ -1627,13 +1627,24 @@ test("/upgrade installs latest package and schedules a detached official service
   assert.equal(execCalls[3]!.file, "sh");
   assert.deepEqual(execCalls[3]!.args.slice(0, 1), ["-c"]);
   const restartCommand = execCalls[3]!.args[1]!;
-  assert.match(restartCommand, /mkdir -p '\/tmp\/logs' && nohup sh -c 'sleep 3\nexport CODEX_ANYWHERE_HOME=/);
   assert.match(restartCommand, /codex-anywhere\/dist\/cli\.js/);
   assert.match(restartCommand, /codex-anywhere restart-service attempt/);
   assert.match(restartCommand, /codex-anywhere restart-service succeeded/);
   assert.match(restartCommand, /codex-anywhere install-service attempt/);
   assert.match(restartCommand, /codex-anywhere install-service succeeded/);
   assert.match(restartCommand, /upgrade-restart\.log/);
+  if (process.platform === "darwin") {
+    assert.match(restartCommand, /launchctl bootstrap/);
+    assert.match(restartCommand, /launchctl kickstart -k/);
+    assert.match(restartCommand, /ai\.mempat\.codex-anywhere\.upgrade-restart/);
+    assert.doesNotMatch(restartCommand, /nohup sh -c 'sleep 3/);
+  } else if (process.platform === "linux") {
+    assert.match(restartCommand, /systemd-run --user/);
+    assert.match(restartCommand, /codex-anywhere-upgrade-restart/);
+    assert.match(restartCommand, /command -v systemd-run/);
+  } else {
+    assert.match(restartCommand, /nohup sh -c/);
+  }
   assert.doesNotMatch(restartCommand, /\n  if codex-anywhere restart-service/);
   assert.doesNotMatch(restartCommand, /do;/);
   assert.doesNotMatch(restartCommand, /then;/);
@@ -1643,7 +1654,7 @@ test("/upgrade installs latest package and schedules a detached official service
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
   assert.match(telegram.sentMessages[1]!.text, /codex-anywhere 0\.3\.15/);
-  assert.match(telegram.sentMessages[1]!.text, /detached service restart/);
+  assert.match(telegram.sentMessages[1]!.text, /supervised service restart/);
 });
 
 test("/upgrade reports installed CLI verification failures", async () => {
