@@ -75,6 +75,7 @@ export interface PendingUpgradeNotification {
   targetVersionLine: string;
   startedAt: number;
   failureNotifiedAt: number | null;
+  watchdogMarkerPath?: string | null;
 }
 
 export interface StoredState {

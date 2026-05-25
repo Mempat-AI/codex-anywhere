@@ -1778,6 +1778,10 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.match(restartCommand, /codex-anywhere install-service succeeded/);
   assert.match(restartCommand, /upgrade-restart\.log/);
   assert.match(restartCommand, /export PATH=/);
+  assert.match(restartCommand, /upgrade-restart-watchdog-/);
+  assert.match(restartCommand, /upgrade watchdog marker observed/);
+  assert.match(restartCommand, /Upgrade restart did not become reachable/);
+  assert.doesNotMatch(restartCommand, /test-token/);
   if (process.platform === "darwin") {
     assert.match(restartCommand, /launchctl bootstrap/);
     assert.match(restartCommand, /ai\.mempat\.codex-anywhere\.upgrade-restart/);
@@ -1800,17 +1804,20 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.match(telegram.sentMessages[1]!.text, /codex-anywhere 0\.3\.15/);
   assert.match(telegram.sentMessages[1]!.text, /supervised service restart/);
   assert.match(telegram.sentMessages[1]!.text, /automatic completion message/);
+  assert.match(telegram.sentMessages[1]!.text, /helper will send a failure message/);
 });
 
 test("startup sends pending upgrade completion from the restarted process", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-complete-"));
   const state = testState();
+  const markerPath = path.join(tempDir, "upgrade-watchdog.ok");
   state.pendingUpgradeNotification = {
     chatId: 42,
     fromVersion: "0.3.19",
     targetVersionLine: "codex-anywhere 0.3.20",
     startedAt: Date.now(),
     failureNotifiedAt: null,
+    watchdogMarkerPath: markerPath,
   };
   const telegram = new FakeTelegram();
   const bridge = new CodexAnywhereBridge(
@@ -1831,17 +1838,20 @@ test("startup sends pending upgrade completion from the restarted process", asyn
   assert.match(telegram.sentMessages[0]!.text, /Upgrade completed/);
   assert.match(telegram.sentMessages[0]!.text, /The restarted service reached Telegram successfully/);
   assert.equal(state.pendingUpgradeNotification, null);
+  assert.match(await fs.readFile(markerPath, "utf8"), /^completed /);
 });
 
 test("startup reports pending upgrade failure when Codex initialization fails", async () => {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-failed-"));
   const state = testState();
+  const markerPath = path.join(tempDir, "upgrade-watchdog.ok");
   state.pendingUpgradeNotification = {
     chatId: 42,
     fromVersion: "0.3.19",
     targetVersionLine: "codex-anywhere 0.3.20",
     startedAt: Date.now(),
     failureNotifiedAt: null,
+    watchdogMarkerPath: markerPath,
   };
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
@@ -1869,6 +1879,7 @@ test("startup reports pending upgrade failure when Codex initialization fails", 
   assert.match(telegram.sentMessages[0]!.text, /Upgrade restart failed/);
   assert.match(telegram.sentMessages[0]!.text, /codex was not found on PATH/);
   assert.equal(typeof state.pendingUpgradeNotification?.failureNotifiedAt, "number");
+  assert.match(await fs.readFile(markerPath, "utf8"), /^startup-failed /);
 });
 
 test("/upgrade reports installed CLI verification failures", async () => {

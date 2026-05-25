@@ -42,6 +42,9 @@ export async function loadState(statePath: string): Promise<StoredState> {
     chat.sandboxMode ??= null;
     chat.lastAssistantMessage ??= null;
   }
+  if (state.pendingUpgradeNotification) {
+    state.pendingUpgradeNotification.watchdogMarkerPath ??= null;
+  }
   return state;
 }
 

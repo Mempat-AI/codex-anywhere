@@ -3279,6 +3279,7 @@ export class CodexAnywhereBridge {
           "The restarted service reached Telegram successfully.",
         ].join("\n"),
       );
+      await this.#writeUpgradeWatchdogMarker(pending, "completed");
       this.#state.pendingUpgradeNotification = null;
       await this.#saveState();
     } catch (error) {
@@ -3302,10 +3303,30 @@ export class CodexAnywhereBridge {
           `<code>${escapeTelegramHtml(formatErrorMessage(error))}</code>`,
         ].join("\n"),
       );
+      await this.#writeUpgradeWatchdogMarker(pending, "startup-failed");
       pending.failureNotifiedAt = Date.now();
       await this.#saveState();
     } catch (notifyError) {
       this.#logRuntimeError("upgrade startup failure notification", notifyError);
+    }
+  }
+
+  async #writeUpgradeWatchdogMarker(
+    pending: { watchdogMarkerPath?: string | null },
+    status: string,
+  ): Promise<void> {
+    if (!pending.watchdogMarkerPath) {
+      return;
+    }
+    try {
+      await fs.mkdir(path.dirname(pending.watchdogMarkerPath), { recursive: true });
+      await fs.writeFile(
+        pending.watchdogMarkerPath,
+        `${status} ${new Date().toISOString()}\n`,
+        { mode: 0o600 },
+      );
+    } catch (error) {
+      this.#logRuntimeError("upgrade watchdog marker", error);
     }
   }
 
@@ -3353,12 +3374,19 @@ export class CodexAnywhereBridge {
       );
       const installedCli = await this.#resolveInstalledCodexAnywhereCli();
       const summary = summarizeUpgradeOutput(install.stdout, install.stderr);
+      const storageRoot = path.dirname(this.#configPath);
+      const watchdogMarkerPath = path.join(
+        storageRoot,
+        "logs",
+        `upgrade-restart-watchdog-${randomBytes(8).toString("hex")}.ok`,
+      );
       this.#state.pendingUpgradeNotification = {
         chatId,
         fromVersion: packageJson.version,
         targetVersionLine: installedCli.versionLine,
         startedAt: Date.now(),
         failureNotifiedAt: null,
+        watchdogMarkerPath,
       };
       await this.#saveState();
       pendingUpgradeSaved = true;
@@ -3370,6 +3398,7 @@ export class CodexAnywhereBridge {
           `Verified <code>${escapeTelegramHtml(installedCli.versionLine)}</code>.`,
           "Scheduling a supervised service restart from the official package now.",
           "The restarted service will send an automatic completion message when it is responsive.",
+          "If it never becomes reachable, the restart helper will send a failure message directly.",
         ].join("\n"),
       ).catch((error) => {
         this.#logRuntimeError("upgrade installed notification", error);
@@ -3377,7 +3406,13 @@ export class CodexAnywhereBridge {
       await this.#execFile("sh", ["-c", buildUpgradeServiceRestartCommand({
         nodePath: installedCli.nodePath,
         cliPath: installedCli.cliPath,
-        storageRoot: path.dirname(this.#configPath),
+        storageRoot,
+        configPath: this.#configPath,
+        statePath: this.#statePath,
+        botId: this.#botId,
+        chatId,
+        targetVersionLine: installedCli.versionLine,
+        watchdogMarkerPath,
         pathEnv: process.env.PATH,
         platform: process.platform,
         uid: typeof process.getuid === "function" ? process.getuid() : undefined,
