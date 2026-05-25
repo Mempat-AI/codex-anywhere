@@ -120,7 +120,9 @@ function defaultChatState(overrides: Partial<ChatSessionState> = {}): ChatSessio
     verbose: false,
     queueNextArmed: false,
     queuedTurnInput: null,
+    queuedTurnOriginMessageId: null,
     pendingTurnInput: null,
+    pendingTurnOriginMessageId: null,
     pendingMention: null,
     model: null,
     reasoningEffort: null,
@@ -284,6 +286,7 @@ test("bootstrapCodexAnywhere keeps persisted state intact after a deterministic 
   const initialState: StoredState = {
     version: 1,
     lastUpdateId: 12,
+    pendingUpgradeNotification: null,
     chats: {
       "42": defaultChatState({
         threadId: "thread-existing",

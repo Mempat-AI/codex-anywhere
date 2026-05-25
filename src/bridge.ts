@@ -76,6 +76,16 @@ import {
   formatTurnControlCallbackData,
   parseTurnControlCallbackData,
 } from "./turnControls.js";
+import {
+  buildUpgradeRestartProbeCommand,
+  buildUpgradeServiceRestartCommand,
+  readUpgradeRestartLogTail,
+  waitForUpgradeRestartProbe,
+} from "./upgradeRestart.js";
+import {
+  appendUpgradeDiagnosticEvent,
+  upgradeDiagnosticsPaths,
+} from "./upgradeDiagnostics.js";
 import type {
   BotRuntimeConfig,
   ChatSessionState,
@@ -104,6 +114,8 @@ const COMPUTER_USE_MENTION_TOKEN = "@computer-use";
 const TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024;
 const TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
 const DOWNLOAD_LIST_LIMIT = 50;
+const TURN_STATUS_ANIMATION_INTERVAL_MS = 500;
+const TURN_STATUS_DOT_FRAMES = ["", ".", "..", "..."] as const;
 
 type TelegramClient = Pick<
   TelegramBotApi,
@@ -138,14 +150,15 @@ interface TurnCard {
   threadId: string;
   turnId: string;
   chatId: number;
-  messageId: number | null;
+  detailsMessageId: number | null;
   originMessageId: number | null;
   currentStatus: string;
+  statusAnimationFrame: number;
   finalText: string | null;
   trace: TurnTraceEntry[];
   lastEditAt: number;
   finalized: boolean;
-  overflowSent: boolean;
+  finalSent: boolean;
 }
 
 interface InstalledCodexAnywhereCli {
@@ -189,7 +202,10 @@ export class CodexAnywhereBridge {
   readonly #pendingChatOrigins = new Map<number, PendingTurnOrigin>();
   readonly #pendingTurnOrigins = new Map<string, PendingTurnOrigin>();
   readonly #turnCards = new Map<string, TurnCard>();
+  readonly #turnCardAnimationIntervals = new Map<string, ReturnType<typeof setInterval>>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
+  readonly #finalizedTurnKeys = new Set<string>();
+  readonly #finalizedTurnKeyOrder: string[] = [];
   readonly #hasInitialState: boolean;
   #initialized = false;
   #state: StoredState = {
@@ -237,12 +253,18 @@ export class CodexAnywhereBridge {
     if (!this.#hasInitialState) {
       this.#state = await loadState(this.#statePath);
     }
-    await this.#codex.start();
-    await this.#codex.initialize();
+    try {
+      await this.#codex.start();
+      await this.#codex.initialize();
+    } catch (error) {
+      await this.#notifyPendingUpgradeStartupFailure(error);
+      throw error;
+    }
     if (options?.reconcilePersistedState ?? false) {
       await this.#reconcilePersistedThreads();
     }
     await this.#registerTelegramCommands();
+    await this.#sendPendingUpgradeCompletion();
     if (options?.printStartupHelp ?? true) {
       this.#printStartupHelp();
     }
@@ -262,6 +284,10 @@ export class CodexAnywhereBridge {
     await this.#handleUpdate(update);
   }
 
+  async handlePolledUpdateForTest(update: TelegramUpdate): Promise<void> {
+    await this.#handlePolledUpdate(update);
+  }
+
   async handleNotificationForTest(method: string, params: JsonObject): Promise<void> {
     await this.#handleNotification(method, params);
   }
@@ -272,15 +298,19 @@ export class CodexAnywhereBridge {
         const offset = this.#state.lastUpdateId === null ? null : this.#state.lastUpdateId + 1;
         const updates = await this.#telegram.getUpdates(offset, this.#config.pollTimeoutSeconds);
         for (const update of updates) {
-          this.#state.lastUpdateId = update.update_id;
-          await this.#saveState();
-          await this.#handleUpdate(update);
+          await this.#handlePolledUpdate(update);
         }
       } catch (error) {
         this.#logRuntimeError("telegram poll", error);
         await sleep(1000);
       }
     }
+  }
+
+  async #handlePolledUpdate(update: TelegramUpdate): Promise<void> {
+    await this.#handleUpdate(update);
+    this.#state.lastUpdateId = update.update_id;
+    await this.#saveState();
   }
 
   async #consumeCodexLoop(): Promise<void> {
@@ -501,12 +531,19 @@ export class CodexAnywhereBridge {
 
     if (state.queueNextArmed) {
       state.queuedTurnInput = preparedInput;
+      state.queuedTurnOriginMessageId = originMessageId;
       state.queueNextArmed = false;
       await this.#saveState();
-      await this.#sendHtmlText(chatId, formatPendingInputActionHtml("queued", preparedInput));
+      await this.#sendHtmlText(
+        chatId,
+        formatPendingInputActionHtml("queued", preparedInput),
+        undefined,
+        originMessageId,
+      );
       return;
     }
     state.pendingTurnInput = preparedInput;
+    state.pendingTurnOriginMessageId = originMessageId;
     await this.#saveState();
     await this.#sendTurnControls(chatId, state.activeTurnId);
   }
@@ -2674,7 +2711,12 @@ export class CodexAnywhereBridge {
         state.turnControlMessageId = null;
       }
     }
-    const message = await this.#sendHtmlText(chatId, text, replyMarkup);
+    const message = await this.#sendHtmlText(
+      chatId,
+      text,
+      replyMarkup,
+      state.pendingTurnOriginMessageId,
+    );
     state.turnControlTurnId = turnId;
     state.turnControlMessageId = message.message_id;
     await this.#saveState();
@@ -2702,7 +2744,9 @@ export class CodexAnywhereBridge {
         return;
       }
       const input = state.pendingTurnInput;
+      const originMessageId = state.pendingTurnOriginMessageId;
       state.pendingTurnInput = null;
+      state.pendingTurnOriginMessageId = null;
       await this.#saveState();
       await this.#clearTurnControls(chatId, parsed.turnId);
       await this.#codex.call("turn/steer", {
@@ -2711,17 +2755,29 @@ export class CodexAnywhereBridge {
         expectedTurnId: state.activeTurnId,
       });
       await this.#telegram.answerCallbackQuery(callbackQueryId, "Steering current turn");
-      await this.#sendHtmlText(chatId, formatPendingInputActionHtml("steered", input));
+      await this.#sendHtmlText(
+        chatId,
+        formatPendingInputActionHtml("steered", input),
+        undefined,
+        originMessageId,
+      );
       return;
     }
     if (parsed.action === "queue") {
       if (state.pendingTurnInput) {
         state.queuedTurnInput = state.pendingTurnInput;
+        state.queuedTurnOriginMessageId = state.pendingTurnOriginMessageId;
         state.pendingTurnInput = null;
+        state.pendingTurnOriginMessageId = null;
         await this.#saveState();
         await this.#clearTurnControls(chatId, parsed.turnId);
         await this.#telegram.answerCallbackQuery(callbackQueryId, "Queued for next turn");
-        await this.#sendHtmlText(chatId, formatPendingInputActionHtml("queued", state.queuedTurnInput));
+        await this.#sendHtmlText(
+          chatId,
+          formatPendingInputActionHtml("queued", state.queuedTurnInput),
+          undefined,
+          state.queuedTurnOriginMessageId,
+        );
         return;
       }
       state.queueNextArmed = true;
@@ -2733,6 +2789,7 @@ export class CodexAnywhereBridge {
     }
     if (parsed.action === "cancel") {
       state.pendingTurnInput = null;
+      state.pendingTurnOriginMessageId = null;
       await this.#saveState();
       await this.#clearTurnControls(chatId, parsed.turnId);
       await this.#telegram.answerCallbackQuery(callbackQueryId, "Cancelled");
@@ -2813,6 +2870,9 @@ export class CodexAnywhereBridge {
         this.#items.set(item.id, item);
       }
       const turnId = asString(params.turnId);
+      if (threadId && turnId && this.#isTurnFinalized(threadId, turnId)) {
+        return;
+      }
       const chatId = threadId ? this.#findChatIdByThread(threadId) : null;
       if (threadId && turnId && chatId !== null && item) {
         const itemType = asString(item.type);
@@ -2860,6 +2920,9 @@ export class CodexAnywhereBridge {
       if (!turnId || !itemId || chatId === null) {
         return;
       }
+      if (this.#isTurnFinalized(threadId, turnId)) {
+        return;
+      }
       const stream = this.#getOrCreateAgentStream(threadId, turnId, chatId, itemId);
       stream.text += asString(params.delta) ?? "";
       await this.#flushStream(stream, false);
@@ -2872,6 +2935,9 @@ export class CodexAnywhereBridge {
       const item = params.item as JsonObject | undefined;
       const itemType = asString(item?.type);
       if (chatId === null || !turnId || !item || !itemType) {
+        return;
+      }
+      if (this.#isTurnFinalized(threadId, turnId)) {
         return;
       }
       if (itemType === "agentMessage") {
@@ -2925,6 +2991,9 @@ export class CodexAnywhereBridge {
       if (chatId === null || !turn || !turnId) {
         return;
       }
+      if (this.#isTurnFinalized(threadId, turnId)) {
+        return;
+      }
       const state = this.#chatState(chatId);
       if (state.activeTurnId === turnId) {
         state.activeTurnId = null;
@@ -2932,8 +3001,10 @@ export class CodexAnywhereBridge {
       }
       if (!state.queuedTurnInput && state.pendingTurnInput) {
         state.queuedTurnInput = state.pendingTurnInput;
+        state.queuedTurnOriginMessageId = state.pendingTurnOriginMessageId;
       }
       state.pendingTurnInput = null;
+      state.pendingTurnOriginMessageId = null;
       const streams = this.#streamsForTurn(threadId, turnId);
       let lastNonCommentaryMessage: string | null = null;
       for (const stream of streams) {
@@ -2950,7 +3021,9 @@ export class CodexAnywhereBridge {
       this.#stopTypingIndicator(chatId);
       await this.#clearTurnControls(chatId, turnId);
       const queuedTurnInput = state.queuedTurnInput;
+      const queuedTurnOriginMessageId = state.queuedTurnOriginMessageId;
       state.queuedTurnInput = null;
+      state.queuedTurnOriginMessageId = null;
       const status = asString(turn.status) ?? "unknown";
       const error = (turn.error as JsonObject | undefined)?.message;
       const completionHtml = formatTurnCompletionHtml(status, typeof error === "string" ? error : null);
@@ -2963,8 +3036,13 @@ export class CodexAnywhereBridge {
         completionHtml,
       );
       if (queuedTurnInput) {
-        await this.#sendHtmlText(chatId, formatPendingInputActionHtml("starting", queuedTurnInput));
-        await this.#startTurn(chatId, queuedTurnInput);
+        await this.#sendHtmlText(
+          chatId,
+          formatPendingInputActionHtml("starting", queuedTurnInput),
+          undefined,
+          queuedTurnOriginMessageId,
+        );
+        await this.#startTurn(chatId, queuedTurnInput, undefined, queuedTurnOriginMessageId);
       }
       return;
     }
@@ -3189,9 +3267,118 @@ export class CodexAnywhereBridge {
     await this.#sendText(chatId, `codex-anywhere ${packageJson.version}`);
   }
 
+  async #sendPendingUpgradeCompletion(): Promise<void> {
+    const pending = this.#state.pendingUpgradeNotification ?? null;
+    if (!pending) {
+      return;
+    }
+
+    try {
+      const diagnosticStatePath = pending.diagnosticStatePath
+        ?? upgradeDiagnosticsPaths(path.dirname(this.#configPath)).statePath;
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId: pending.attemptId ?? `legacy-${pending.startedAt}`,
+        botId: this.#botId,
+        chatId: pending.chatId,
+        event: "upgrade-completed",
+        fromVersion: pending.fromVersion,
+        targetVersionLine: pending.targetVersionLine,
+        watchdogMarkerPath: pending.watchdogMarkerPath ?? null,
+      });
+      await this.#sendHtmlText(
+        pending.chatId,
+        [
+          "<b>Upgrade completed</b>",
+          `Now running <code>codex-anywhere ${escapeTelegramHtml(packageJson.version)}</code>.`,
+          `Installed target: <code>${escapeTelegramHtml(pending.targetVersionLine)}</code>.`,
+          "The restarted service reached Telegram successfully.",
+          `Diagnostics: <code>${escapeTelegramHtml(diagnosticStatePath)}</code>`,
+        ].join("\n"),
+      );
+      await this.#writeUpgradeWatchdogMarker(pending, "completed");
+      this.#state.pendingUpgradeNotification = null;
+      await this.#saveState();
+    } catch (error) {
+      this.#logRuntimeError("upgrade completion notification", error);
+    }
+  }
+
+  async #notifyPendingUpgradeStartupFailure(error: unknown): Promise<void> {
+    const pending = this.#state.pendingUpgradeNotification ?? null;
+    if (!pending || pending.failureNotifiedAt !== null) {
+      return;
+    }
+
+    try {
+      const diagnosticStatePath = pending.diagnosticStatePath
+        ?? upgradeDiagnosticsPaths(path.dirname(this.#configPath)).statePath;
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId: pending.attemptId ?? `legacy-${pending.startedAt}`,
+        botId: this.#botId,
+        chatId: pending.chatId,
+        event: "upgrade-startup-failed",
+        error: formatErrorMessage(error),
+        fromVersion: pending.fromVersion,
+        targetVersionLine: pending.targetVersionLine,
+        watchdogMarkerPath: pending.watchdogMarkerPath ?? null,
+      });
+      await this.#sendHtmlText(
+        pending.chatId,
+        [
+          "<b>Upgrade restart failed</b>",
+          `Installed target: <code>${escapeTelegramHtml(pending.targetVersionLine)}</code>.`,
+          "The service restarted but did not reach Codex initialization.",
+          `<code>${escapeTelegramHtml(formatErrorMessage(error))}</code>`,
+          `Diagnostics: <code>${escapeTelegramHtml(diagnosticStatePath)}</code>`,
+        ].join("\n"),
+      );
+      await this.#writeUpgradeWatchdogMarker(pending, "startup-failed");
+      pending.failureNotifiedAt = Date.now();
+      await this.#saveState();
+    } catch (notifyError) {
+      this.#logRuntimeError("upgrade startup failure notification", notifyError);
+    }
+  }
+
+  async #appendUpgradeDiagnosticEvent(event: {
+    attemptId: string;
+    event: string;
+    [key: string]: unknown;
+  }): Promise<void> {
+    try {
+      await appendUpgradeDiagnosticEvent(path.dirname(this.#configPath), event);
+    } catch (error) {
+      this.#logRuntimeError("upgrade diagnostics", error);
+    }
+  }
+
+  async #writeUpgradeWatchdogMarker(
+    pending: { watchdogMarkerPath?: string | null },
+    status: string,
+  ): Promise<void> {
+    if (!pending.watchdogMarkerPath) {
+      return;
+    }
+    try {
+      await fs.mkdir(path.dirname(pending.watchdogMarkerPath), { recursive: true });
+      await fs.writeFile(
+        pending.watchdogMarkerPath,
+        `${status} ${new Date().toISOString()}\n`,
+        { mode: 0o600 },
+      );
+    } catch (error) {
+      this.#logRuntimeError("upgrade watchdog marker", error);
+    }
+  }
+
   async #upgradeSelf(chatId: number, args: string): Promise<void> {
-    if (args.trim()) {
-      await this.#sendText(chatId, "Usage: /upgrade");
+    const trimmedArgs = args.trim();
+    if (trimmedArgs === "test" || trimmedArgs === "check") {
+      await this.#testUpgradeRestart(chatId);
+      return;
+    }
+    if (trimmedArgs) {
+      await this.#sendText(chatId, "Usage: /upgrade\n/upgrade test");
       return;
     }
 
@@ -3204,16 +3391,32 @@ export class CodexAnywhereBridge {
       return;
     }
 
+    const storageRoot = path.dirname(this.#configPath);
+    const attemptId = randomBytes(8).toString("hex");
+    const diagnostics = upgradeDiagnosticsPaths(storageRoot);
+    const restartLogPath = path.join(storageRoot, "logs", "upgrade-restart.log");
+    await this.#appendUpgradeDiagnosticEvent({
+      attemptId,
+      botId: this.#botId,
+      chatId,
+      event: "upgrade-started",
+      fromVersion: packageJson.version,
+      restartLogPath,
+      workspaceCwd: this.#config.workspaceCwd,
+    });
+
     const startLines = [
       "<b>Upgrade started</b>",
       "Installing <code>codex-anywhere@latest</code> with npm.",
       "If installation succeeds, the background service will be restarted from the official package.",
+      `Diagnostics: <code>${escapeTelegramHtml(diagnostics.statePath)}</code>`,
     ];
     await this.#sendHtmlText(
       chatId,
       startLines.join("\n"),
     );
 
+    let pendingUpgradeSaved = false;
     try {
       const install = await this.#execFile(
         "npm",
@@ -3227,35 +3430,160 @@ export class CodexAnywhereBridge {
       );
       const installedCli = await this.#resolveInstalledCodexAnywhereCli();
       const summary = summarizeUpgradeOutput(install.stdout, install.stderr);
+      const watchdogMarkerPath = path.join(
+        storageRoot,
+        "logs",
+        `upgrade-restart-watchdog-${randomBytes(8).toString("hex")}.ok`,
+      );
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId,
+        botId: this.#botId,
+        chatId,
+        event: "upgrade-installed",
+        fromVersion: packageJson.version,
+        installSummary: summary,
+        targetVersionLine: installedCli.versionLine,
+        watchdogMarkerPath,
+        restartLogPath,
+      });
+      this.#state.pendingUpgradeNotification = {
+        chatId,
+        fromVersion: packageJson.version,
+        targetVersionLine: installedCli.versionLine,
+        startedAt: Date.now(),
+        failureNotifiedAt: null,
+        attemptId,
+        diagnosticJournalPath: diagnostics.journalPath,
+        diagnosticStatePath: diagnostics.statePath,
+        watchdogMarkerPath,
+      };
+      await this.#saveState();
+      pendingUpgradeSaved = true;
       await this.#sendHtmlText(
         chatId,
         [
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
           `Verified <code>${escapeTelegramHtml(installedCli.versionLine)}</code>.`,
-          "Scheduling a detached service restart from the official package now. Send /version after a few seconds to confirm.",
+          "Scheduling a supervised service restart from the official package now.",
+          "The restarted service will send an automatic completion message when it is responsive.",
+          "If it never becomes reachable, the restart helper will send a failure message directly.",
+          `Diagnostics: <code>${escapeTelegramHtml(diagnostics.statePath)}</code>`,
+          `Events: <code>${escapeTelegramHtml(diagnostics.journalPath)}</code>`,
+          `Restart log: <code>${escapeTelegramHtml(restartLogPath)}</code>`,
         ].join("\n"),
-      );
-      await this.#execFile("sh", ["-c", buildDetachedServiceRestartCommand({
+      ).catch((error) => {
+        this.#logRuntimeError("upgrade installed notification", error);
+      });
+      await this.#execFile("sh", ["-c", buildUpgradeServiceRestartCommand({
         nodePath: installedCli.nodePath,
         cliPath: installedCli.cliPath,
-        storageRoot: path.dirname(this.#configPath),
+        storageRoot,
+        configPath: this.#configPath,
+        statePath: this.#statePath,
+        botId: this.#botId,
+        chatId,
+        targetVersionLine: installedCli.versionLine,
+        upgradeAttemptId: attemptId,
+        diagnosticJournalPath: diagnostics.journalPath,
+        diagnosticStatePath: diagnostics.statePath,
+        watchdogMarkerPath,
+        pathEnv: process.env.PATH,
+        platform: process.platform,
+        uid: typeof process.getuid === "function" ? process.getuid() : undefined,
       })], {
         cwd: this.#config.workspaceCwd,
         env: process.env,
         timeout: 10_000,
         maxBuffer: 1024 * 1024,
       });
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId,
+        botId: this.#botId,
+        chatId,
+        event: "upgrade-helper-scheduled",
+        targetVersionLine: installedCli.versionLine,
+        watchdogMarkerPath,
+        restartLogPath,
+      });
     } catch (error) {
+      await this.#appendUpgradeDiagnosticEvent({
+        attemptId,
+        botId: this.#botId,
+        chatId,
+        event: "upgrade-failed",
+        error: formatErrorMessage(error),
+      });
+      if (pendingUpgradeSaved) {
+        this.#state.pendingUpgradeNotification = null;
+        await this.#saveState();
+      }
       const message = error instanceof Error ? error.message : String(error);
       await this.#sendHtmlText(
         chatId,
         [
           "<b>Upgrade failed</b>",
           `<code>${escapeTelegramHtml(message)}</code>`,
+          `Diagnostics: <code>${escapeTelegramHtml(diagnostics.statePath)}</code>`,
           "Run <code>npm install -g codex-anywhere@latest</code>, then <code>codex-anywhere install-service</code> manually.",
         ].join("\n"),
       );
+    }
+  }
+
+  async #testUpgradeRestart(chatId: number): Promise<void> {
+    const state = this.#chatState(chatId);
+    if (state.activeTurnId) {
+      await this.#reconcileActiveTurnState(chatId);
+    }
+    if (state.activeTurnId) {
+      await this.#sendText(chatId, "/upgrade test is disabled while a task is in progress.");
+      return;
+    }
+
+    const probe = buildUpgradeRestartProbeCommand({
+      storageRoot: path.dirname(this.#configPath),
+      platform: process.platform,
+      uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+    });
+
+    await this.#sendHtmlText(
+      chatId,
+      [
+        "<b>Upgrade self-test started</b>",
+        "Scheduling a supervised restart helper probe through the same launchd/systemd path used by <code>/upgrade</code>.",
+      ].join("\n"),
+    );
+
+    try {
+      await this.#execFile("sh", ["-c", probe.command], {
+        cwd: this.#config.workspaceCwd,
+        env: process.env,
+        timeout: 10_000,
+        maxBuffer: 1024 * 1024,
+      });
+      await waitForUpgradeRestartProbe(probe, { timeoutMs: 10_000, intervalMs: 250 });
+      await fs.rm(probe.markerPath, { force: true });
+      await this.#sendHtmlText(
+        chatId,
+        [
+          "<b>Upgrade self-test passed</b>",
+          "The supervised helper ran outside the bot process and wrote its probe marker.",
+          `Log: <code>${escapeTelegramHtml(probe.logPath)}</code>`,
+        ].join("\n"),
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const logTail = await readUpgradeRestartLogTail(probe.logPath);
+      const lines = [
+        "<b>Upgrade self-test failed</b>",
+        `<code>${escapeTelegramHtml(message)}</code>`,
+        `Log: <code>${escapeTelegramHtml(probe.logPath)}</code>`,
+      ];
+      if (logTail) {
+        lines.push("", "<b>Log tail</b>", `<code>${escapeTelegramHtml(logTail)}</code>`);
+      }
+      await this.#sendHtmlText(chatId, lines.join("\n"));
     }
   }
 
@@ -3399,13 +3727,13 @@ export class CodexAnywhereBridge {
     );
 
     if (stream.phase === "commentary") {
-      card.currentStatus = latestStatusLine(raw) ?? "Thinking";
+      this.#setTurnCardStatus(card, latestStatusLine(raw) ?? "Thinking");
       if (force && raw.trim()) {
         this.#addTurnTrace(card, "Preamble", raw.trim());
       }
       await this.#flushTurnCard(card, { force });
     } else {
-      card.currentStatus = "Writing final answer";
+      this.#setTurnCardStatus(card, "Writing final answer");
       card.finalText = raw;
       await this.#flushTurnCard(card, { force });
     }
@@ -3437,6 +3765,7 @@ export class CodexAnywhereBridge {
     chatId: number,
     text: string,
     replyMarkup?: JsonObject,
+    replyToMessageId?: number | null,
   ): Promise<{ message_id: number }> {
     const chunks = splitTelegramChunks(text);
     let last!: { message_id: number };
@@ -3446,6 +3775,7 @@ export class CodexAnywhereBridge {
         chunk,
         i === chunks.length - 1 ? replyMarkup : undefined,
         "HTML",
+        i === 0 ? replyToMessageId : undefined,
       );
     }
     return last;
@@ -3463,17 +3793,19 @@ export class CodexAnywhereBridge {
       threadId,
       turnId,
       chatId,
-      messageId: null,
+      detailsMessageId: null,
       originMessageId: origin?.originMessageId ?? null,
       currentStatus: "Thinking",
+      statusAnimationFrame: 0,
       finalText: null,
       trace: [],
       lastEditAt: 0,
       finalized: false,
-      overflowSent: false,
+      finalSent: false,
     };
     this.#turnCards.set(key, card);
     await this.#flushTurnCard(card, { force: true });
+    this.#startTurnCardAnimation(card);
     return card;
   }
 
@@ -3484,7 +3816,7 @@ export class CodexAnywhereBridge {
     status: string,
   ): Promise<void> {
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
-    card.currentStatus = status;
+    this.#setTurnCardStatus(card, status);
     await this.#flushTurnCard(card, { force: true });
   }
 
@@ -3497,8 +3829,56 @@ export class CodexAnywhereBridge {
   ): Promise<void> {
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
     this.#addTurnTrace(card, label, text);
-    card.currentStatus = compactTraceLine(label, text);
+    this.#setTurnCardStatus(card, compactTraceLine(text));
     await this.#flushTurnCard(card, { force: true });
+  }
+
+  #setTurnCardStatus(card: TurnCard, status: string): void {
+    if (card.currentStatus !== status) {
+      card.currentStatus = status;
+      card.statusAnimationFrame = 0;
+    }
+    if (isAnimatedTurnStatus(status) && !card.finalized) {
+      this.#startTurnCardAnimation(card);
+    } else {
+      this.#stopTurnCardAnimation(turnKey(card.threadId, card.turnId));
+    }
+  }
+
+  #startTurnCardAnimation(card: TurnCard): void {
+    const key = turnKey(card.threadId, card.turnId);
+    if (this.#turnCardAnimationIntervals.has(key)) {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      void this.#advanceTurnCardAnimation(key).catch((error) => {
+        this.#logRuntimeError("animate turn card", error);
+      });
+    }, TURN_STATUS_ANIMATION_INTERVAL_MS);
+    interval.unref?.();
+    this.#turnCardAnimationIntervals.set(key, interval);
+  }
+
+  async #advanceTurnCardAnimation(key: string): Promise<void> {
+    const card = this.#turnCards.get(key);
+    if (!card || card.finalized || !isAnimatedTurnStatus(card.currentStatus)) {
+      this.#stopTurnCardAnimation(key);
+      return;
+    }
+
+    card.statusAnimationFrame =
+      card.statusAnimationFrame >= Number.MAX_SAFE_INTEGER ? 0 : card.statusAnimationFrame + 1;
+    await this.#flushTurnCard(card, { force: true });
+  }
+
+  #stopTurnCardAnimation(key: string): void {
+    const interval = this.#turnCardAnimationIntervals.get(key);
+    if (!interval) {
+      return;
+    }
+    clearInterval(interval);
+    this.#turnCardAnimationIntervals.delete(key);
   }
 
   #addTurnTrace(card: TurnCard, label: string, text: string): void {
@@ -3524,6 +3904,9 @@ export class CodexAnywhereBridge {
     errorMessage: string | null,
     fallbackHtml: string | null,
   ): Promise<void> {
+    if (this.#isTurnFinalized(threadId, turnId)) {
+      return;
+    }
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
     if (status !== "completed") {
       card.finalText = errorMessage ? `Turn ${status}: ${errorMessage}` : `Turn ${status}`;
@@ -3531,12 +3914,32 @@ export class CodexAnywhereBridge {
         this.#addTurnTrace(card, "Status", stripTelegramHtml(fallbackHtml));
       }
     }
-    card.currentStatus = status === "completed" ? "Done" : `Turn ${status}`;
+    this.#setTurnCardStatus(card, status === "completed" ? "Done" : `Turn ${status}`);
     card.finalized = true;
     await this.#flushTurnCard(card, { force: true });
     this.#pendingTurnOrigins.delete(turnKey(threadId, turnId));
     this.#pendingChatOrigins.delete(chatId);
-    this.#turnCards.delete(turnKey(threadId, turnId));
+    const key = turnKey(threadId, turnId);
+    this.#stopTurnCardAnimation(key);
+    this.#turnCards.delete(key);
+    this.#rememberFinalizedTurnKey(key);
+  }
+
+  #isTurnFinalized(threadId: string, turnId: string): boolean {
+    return this.#finalizedTurnKeys.has(turnKey(threadId, turnId));
+  }
+
+  #rememberFinalizedTurnKey(key: string): void {
+    if (!this.#finalizedTurnKeys.has(key)) {
+      this.#finalizedTurnKeys.add(key);
+      this.#finalizedTurnKeyOrder.push(key);
+    }
+    while (this.#finalizedTurnKeyOrder.length > 500) {
+      const staleKey = this.#finalizedTurnKeyOrder.shift();
+      if (staleKey) {
+        this.#finalizedTurnKeys.delete(staleKey);
+      }
+    }
   }
 
   async #flushTurnCard(card: TurnCard, options: { force: boolean }): Promise<void> {
@@ -3545,32 +3948,37 @@ export class CodexAnywhereBridge {
       return;
     }
 
-    const chunks = buildTurnCardHtmlChunks(card);
-    const firstChunk = chunks[0] ?? renderLiveTurnCardHtml(card);
-    if (card.messageId === null) {
+    const detailsHtml = renderTurnDetailsCardHtml(card);
+    if (card.detailsMessageId === null) {
       const message = await this.#telegram.sendMessage(
         card.chatId,
-        firstChunk,
+        detailsHtml,
         undefined,
         "HTML",
         card.originMessageId,
       );
-      card.messageId = message.message_id;
+      card.detailsMessageId = message.message_id;
     } else {
-      await this.#telegram.editMessageText(card.chatId, card.messageId, firstChunk, undefined, "HTML");
+      await this.#telegram.editMessageText(card.chatId, card.detailsMessageId, detailsHtml, undefined, "HTML");
     }
 
-    if (card.finalized && !card.overflowSent && chunks.length > 1) {
-      for (let i = 1; i < chunks.length; i++) {
-        await this.#telegram.sendMessage(
-          card.chatId,
-          chunks[i]!,
-          undefined,
-          "HTML",
-          card.originMessageId,
-        );
+    if (card.finalized && !card.finalSent) {
+      const chunks = buildTurnFinalHtmlChunks(card);
+      card.finalSent = true;
+      try {
+        for (const chunk of chunks) {
+          await this.#telegram.sendMessage(
+            card.chatId,
+            chunk,
+            undefined,
+            "HTML",
+            card.originMessageId,
+          );
+        }
+      } catch (error) {
+        card.finalSent = false;
+        throw error;
       }
-      card.overflowSent = true;
     }
 
     card.lastEditAt = now;
@@ -4101,7 +4509,9 @@ export class CodexAnywhereBridge {
         verbose: false,
         queueNextArmed: false,
         queuedTurnInput: null,
+        queuedTurnOriginMessageId: null,
         pendingTurnInput: null,
+        pendingTurnOriginMessageId: null,
         pendingMention: null,
         model: null,
         reasoningEffort: null,
@@ -4138,7 +4548,9 @@ export class CodexAnywhereBridge {
     state.turnControlMessageId = null;
     state.queueNextArmed = false;
     state.queuedTurnInput = null;
+    state.queuedTurnOriginMessageId = null;
     state.pendingTurnInput = null;
+    state.pendingTurnOriginMessageId = null;
     state.pendingMention = null;
     state.lastAssistantMessage = null;
   }
@@ -4275,63 +4687,67 @@ function turnKey(threadId: string, turnId: string): string {
   return `${threadId}:${turnId}`;
 }
 
-function buildTurnCardHtmlChunks(card: TurnCard): string[] {
-  if (!card.finalized) {
-    if (card.finalText) {
-      return [
-        joinTurnCardSections(
-          renderAssistantTextHtml(truncatePlain(card.finalText, 1400)),
-          renderTurnTraceHtml(card.trace),
-        ),
-      ];
-    }
-    return [renderLiveTurnCardHtml(card)];
-  }
-
-  const finalText = card.finalText?.trim() || "Done.";
-  return appendTurnTraceHtml(
-    splitTelegramChunks(finalText, 3000).map(renderAssistantTextHtml),
-    renderTurnTraceHtml(card.trace),
-  );
-}
-
-function renderLiveTurnCardHtml(card: TurnCard): string {
-  return joinTurnCardSections(
-    escapeTelegramHtml(truncatePlain(card.currentStatus, 1400)),
-    renderTurnTraceHtml(card.trace),
-  );
-}
-
-function appendTurnTraceHtml(chunks: string[], traceHtml: string): string[] {
-  if (chunks.length === 0) {
-    return [traceHtml];
-  }
-  const lastIndex = chunks.length - 1;
-  const lastChunk = chunks[lastIndex]!;
-  if (lastChunk.length + traceHtml.length + 2 <= 3900) {
-    chunks[lastIndex] = joinTurnCardSections(lastChunk, traceHtml);
-    return chunks;
-  }
-  return [...chunks, traceHtml];
-}
-
-function joinTurnCardSections(primaryHtml: string, detailsHtml: string): string {
-  return `${primaryHtml}\n\n${detailsHtml}`;
-}
-
 function renderTurnTraceHtml(trace: TurnTraceEntry[]): string {
   const lines = ["Run details"];
   if (trace.length === 0) {
     lines.push("", "Waiting for activity.");
   } else {
-    for (const [index, entry] of trace.entries()) {
+    for (const entry of trace) {
       lines.push(
         "",
-        `${index + 1}. ${entry.label}: ${truncateMultiline(entry.text, 700)}`,
+        truncateMultiline(entry.text, 700),
       );
     }
   }
   return `<blockquote expandable>${escapeTelegramHtml(truncateMultiline(lines.join("\n"), 2400))}</blockquote>`;
+}
+
+function renderTurnDetailsCardHtml(card: TurnCard): string {
+  if (card.finalized) {
+    return renderTurnTraceHtml(card.trace);
+  }
+  return [
+    renderTurnStatusHtml(card),
+    "",
+    renderTurnTraceHtml(card.trace),
+  ].join("\n");
+}
+
+function renderTurnStatusHtml(card: TurnCard): string {
+  const status = truncatePlain(card.currentStatus, 1400);
+  if (!isAnimatedTurnStatus(card.currentStatus)) {
+    return escapeTelegramHtml(status);
+  }
+  const frame = TURN_STATUS_DOT_FRAMES[card.statusAnimationFrame % TURN_STATUS_DOT_FRAMES.length] ?? "";
+  const suffix = frame ? ` ${frame}` : "";
+  return `${renderSweepingBoldHtml(status, card.statusAnimationFrame)}${escapeTelegramHtml(suffix)}`;
+}
+
+function isAnimatedTurnStatus(status: string): boolean {
+  return status === "Thinking" || status === "Writing final answer";
+}
+
+function renderSweepingBoldHtml(text: string, frame: number): string {
+  const chars = Array.from(text);
+  const boldableIndexes = chars
+    .map((char, index) => ({ char, index }))
+    .filter(({ char }) => !/\s/.test(char))
+    .map(({ index }) => index);
+  const boldIndex = boldableIndexes[frame % boldableIndexes.length];
+  if (boldIndex === undefined) {
+    return escapeTelegramHtml(text);
+  }
+  return chars
+    .map((char, index) => {
+      const escaped = escapeTelegramHtml(char);
+      return index === boldIndex ? `<b>${escaped}</b>` : escaped;
+    })
+    .join("");
+}
+
+function buildTurnFinalHtmlChunks(card: TurnCard): string[] {
+  const finalText = card.finalText?.trim() || "Done.";
+  return splitTelegramChunks(finalText, 3900).map(renderAssistantTextHtml);
 }
 
 function latestStatusLine(text: string): string | null {
@@ -4343,9 +4759,9 @@ function latestStatusLine(text: string): string | null {
   return line ? truncatePlain(line.replace(/\s+/g, " "), 180) : null;
 }
 
-function compactTraceLine(label: string, text: string): string {
+function compactTraceLine(text: string): string {
   const line = latestStatusLine(text) ?? text.trim();
-  return `${label}: ${truncatePlain(line, 160)}`;
+  return truncatePlain(line, 160);
 }
 
 function summarizeCommandTrace(item: JsonObject, verbose: boolean): string {
@@ -5095,43 +5511,6 @@ function lastNonEmptyLine(text: string): string | null {
     .map((line) => line.trim())
     .filter(Boolean)
     .at(-1) ?? null;
-}
-
-function buildDetachedServiceRestartCommand(options: {
-  nodePath: string;
-  cliPath: string;
-  storageRoot: string;
-}): string {
-  const logDir = path.join(options.storageRoot, "logs");
-  const logPath = path.join(logDir, "upgrade-restart.log");
-  const serviceCommand = `${shellQuote(options.nodePath)} ${shellQuote(options.cliPath)}`;
-  const script = [
-    "sleep 3",
-    `export CODEX_ANYWHERE_HOME=${shellQuote(options.storageRoot)}`,
-    `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') using ${serviceCommand}"`,
-    `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') installed version: $(${serviceCommand} --version 2>&1)"`,
-    "for attempt in 1 2 3 4 5; do",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service attempt ${attempt}\"",
-    `  if ${serviceCommand} restart-service; then`,
-    "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service succeeded\"",
-    "    exit 0",
-    "  fi",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere restart-service failed\"",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service attempt ${attempt}\"",
-    `  if ${serviceCommand} install-service; then`,
-    "    echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service succeeded\"",
-    "    exit 0",
-    "  fi",
-    "  echo \"$(date -u '+%Y-%m-%dT%H:%M:%SZ') codex-anywhere install-service failed\"",
-    "  sleep 3",
-    "done",
-    "exit 1",
-  ].join("\n");
-  return `mkdir -p ${shellQuote(logDir)} && nohup sh -c ${shellQuote(script)} >${shellQuote(logPath)} 2>&1 &`;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function parseAccountLoginArgs(args: string): { ok: true; params: JsonObject } | { ok: false; message: string } {

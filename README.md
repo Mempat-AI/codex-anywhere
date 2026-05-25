@@ -96,6 +96,7 @@ Send a task to start a new Codex session, or use these commands:
 - `/goal` shows or changes the current goal
 - `/account` shows, signs in, switches, or signs out of Codex
 - `/upgrade` updates Codex Anywhere and relaunches the service
+- `/upgrade test` verifies that the supervised restart helper can run
 - `/esc` stops the active turn
 
 You can also send screenshots, photos, and files. Text files such as `.txt`, `.log`, `.json`, and `.crash` are sent as readable text so Codex can inspect them directly.
@@ -126,6 +127,7 @@ Logs are written to `logs/` under the Codex Anywhere storage root (`CODEX_ANYWHE
 | `/account [status\|login\|switch\|logout]` | Manage Codex sign-in |
 | `/goal [status\|set <objective>\|clear]` | Manage the current goal |
 | `/upgrade` | Upgrade Codex Anywhere |
+| `/upgrade test` | Test the upgrade restart helper without installing |
 | `/omx [args]` | Run Oh-My-Codex commands |
 | `/computer <task>` | Use Computer Use |
 | `/esc` | Interrupt the active turn |

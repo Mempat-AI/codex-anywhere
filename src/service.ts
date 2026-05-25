@@ -237,9 +237,11 @@ export async function runBackgroundServiceCommand(
   const packageRoot = options.packageRoot ?? resolvePackageRoot();
   const existingConfig =
     (await (options.loadConfig ?? loadConfig)(storagePaths.configPath)) ?? null;
+  const nodePath = options.nodePath ?? process.execPath;
+  const servicePathEnv = buildServicePathEnv(env.PATH, nodePath);
   const programArguments = await resolveServiceProgramArguments({
     packageRoot,
-    nodePath: options.nodePath ?? process.execPath,
+    nodePath,
     tsxCliPath: options.tsxCliPath,
   });
 
@@ -250,7 +252,7 @@ export async function runBackgroundServiceCommand(
       storageRoot,
       homeDir,
       uid,
-      pathEnv: env.PATH ?? "",
+      pathEnv: servicePathEnv,
       programArguments,
       extraEnv: {
         HOME: env.HOME ?? homeDir,
@@ -320,7 +322,7 @@ export async function runBackgroundServiceCommand(
       storageRoot,
       homeDir,
       configHome: env.XDG_CONFIG_HOME,
-      pathEnv: env.PATH ?? "",
+      pathEnv: servicePathEnv,
       programArguments,
       extraEnv: {
         HOME: env.HOME ?? homeDir,
@@ -390,9 +392,7 @@ async function installLaunchAgent(
   spec: LaunchAgentSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(spec.plistPath), { recursive: true });
-  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
-  await fs.writeFile(spec.plistPath, renderLaunchAgentPlist(spec), "utf8");
+  await writeLaunchAgentPlist(spec);
   await runLaunchctl(execFile, ["enable", spec.serviceTarget], { ignoreFailure: true });
   await runLaunchctl(execFile, ["bootout", spec.domainTarget, spec.plistPath], {
     ignoreFailure: true,
@@ -427,6 +427,7 @@ async function restartLaunchAgent(
   spec: LaunchAgentSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
+  await writeLaunchAgentPlist(spec);
   await runLaunchctl(execFile, ["enable", spec.serviceTarget], { ignoreFailure: true });
   await runLaunchctl(execFile, ["bootout", spec.domainTarget, spec.plistPath], {
     ignoreFailure: true,
@@ -488,9 +489,7 @@ async function installLinuxSystemdUnit(
   spec: LinuxSystemdServiceSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
-  await fs.mkdir(path.dirname(spec.unitPath), { recursive: true });
-  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
-  await fs.writeFile(spec.unitPath, renderLinuxSystemdUnit(spec), "utf8");
+  await writeLinuxSystemdUnit(spec);
   await runSystemctl(execFile, ["--user", "daemon-reload"]);
   await runSystemctl(execFile, ["--user", "enable", "--now", spec.serviceName]);
 }
@@ -516,9 +515,22 @@ async function restartLinuxSystemdUnit(
   spec: LinuxSystemdServiceSpec,
   execFile: ServiceExecFile,
 ): Promise<void> {
+  await writeLinuxSystemdUnit(spec);
   await runSystemctl(execFile, ["--user", "daemon-reload"]);
   await runSystemctl(execFile, ["--user", "enable", spec.serviceName]);
   await runSystemctl(execFile, ["--user", "restart", spec.serviceName]);
+}
+
+async function writeLaunchAgentPlist(spec: LaunchAgentSpec): Promise<void> {
+  await fs.mkdir(path.dirname(spec.plistPath), { recursive: true });
+  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
+  await fs.writeFile(spec.plistPath, renderLaunchAgentPlist(spec), "utf8");
+}
+
+async function writeLinuxSystemdUnit(spec: LinuxSystemdServiceSpec): Promise<void> {
+  await fs.mkdir(path.dirname(spec.unitPath), { recursive: true });
+  await fs.mkdir(path.dirname(spec.stdoutPath), { recursive: true });
+  await fs.writeFile(spec.unitPath, renderLinuxSystemdUnit(spec), "utf8");
 }
 
 async function uninstallLinuxSystemdUnit(
@@ -660,6 +672,25 @@ function sanitizeEnvironmentVariables(
     }
   }
   return sanitized;
+}
+
+function buildServicePathEnv(pathEnv: string | undefined, nodePath: string): string {
+  const fallbackEntries = [
+    path.dirname(nodePath),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  const entries = [
+    ...(pathEnv ?? "").split(":"),
+    ...fallbackEntries,
+  ].filter(Boolean);
+  return Array.from(new Set(entries)).join(":");
 }
 
 function buildServiceId(storageRoot: string): string {

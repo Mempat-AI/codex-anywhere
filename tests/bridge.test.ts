@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { CodexAnywhereBridge } from "../src/bridge.js";
 import { loadConfig, loadState, saveConfig, saveState } from "../src/persistence.js";
@@ -90,6 +91,32 @@ class FakeTelegram {
   async deleteMessage(): Promise<void> {}
 }
 
+class DelayedEditTelegram extends FakeTelegram {
+  delayEdits = false;
+  readonly editWaiters: Array<() => void> = [];
+
+  override async editMessageText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    replyMarkup?: JsonObject,
+    parseMode?: string,
+  ): Promise<void> {
+    if (this.delayEdits) {
+      await new Promise<void>((resolve) => {
+        this.editWaiters.push(resolve);
+      });
+    }
+    await super.editMessageText(chatId, messageId, text, replyMarkup, parseMode);
+  }
+
+  releaseEdits(): void {
+    for (const resolve of this.editWaiters.splice(0)) {
+      resolve();
+    }
+  }
+}
+
 class FakeCodex {
   readonly calls: Array<{ method: string; params?: JsonObject }> = [];
 
@@ -149,6 +176,7 @@ function testState(): StoredState {
   return {
     version: 1,
     lastUpdateId: null,
+    pendingUpgradeNotification: null,
     chats: {},
   };
 }
@@ -163,7 +191,9 @@ function testChatState(overrides: Partial<ChatSessionState> = {}): ChatSessionSt
     verbose: false,
     queueNextArmed: false,
     queuedTurnInput: null,
+    queuedTurnOriginMessageId: null,
     pendingTurnInput: null,
+    pendingTurnOriginMessageId: null,
     pendingMention: null,
     model: null,
     reasoningEffort: null,
@@ -189,11 +219,11 @@ function computerUseInput(task: string): JsonObject[] {
   ];
 }
 
-function telegramMessageUpdate(text: string): TelegramUpdate {
+function telegramMessageUpdate(text: string, messageId = 1): TelegramUpdate {
   return {
-    update_id: 1,
+    update_id: messageId,
     message: {
-      message_id: 1,
+      message_id: messageId,
       chat: { id: 42, type: "private" },
       from: { id: 1 },
       text,
@@ -237,6 +267,16 @@ function telegramCallbackUpdate(data: string): TelegramUpdate {
 
 const serialTest = { concurrency: false } as const;
 const runOmxCommandTest = process.env.SKIP_OMX_COMMAND_TESTS === "1" ? test.skip : test;
+
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 50; i += 1) {
+    if (condition()) {
+      return;
+    }
+    await sleep(10);
+  }
+  assert.fail("condition was not met in time");
+}
 
 runOmxCommandTest("bridge routes /omx version through Telegram message output", serialTest, async () => {
   const telegram = new FakeTelegram();
@@ -347,7 +387,7 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.equal(telegram.sentMessages.length, 1);
   assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.match(telegram.sentMessages[0]!.text, /^<b>T<\/b>hinking\n/);
   assert.equal(telegram.editedMessages.length, 1);
   assert.equal(telegram.editedMessages[0]!.messageId, 1);
 
@@ -359,14 +399,71 @@ test("final agent message chunks are sent from the turn card only once", async (
     },
   });
 
-  assert.equal(telegram.sentMessages.length, 3);
+  assert.equal(telegram.sentMessages.length, 4);
+  assert.match(telegram.sentMessages[0]!.text, /Run details/);
+  assert.doesNotMatch(telegram.sentMessages[0]!.text, /^a+$/);
   assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[2]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[3]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
+  assert.equal(telegram.sentMessages[2]!.parseMode, "HTML");
+  assert.equal(telegram.sentMessages[3]!.parseMode, "HTML");
   assert.equal(telegram.editedMessages.length, 2);
   assert.equal(telegram.editedMessages[1]!.messageId, 1);
+  assert.match(telegram.editedMessages[1]!.text, /Run details/);
+  assert.doesNotMatch(telegram.editedMessages[1]!.text, /^a+$/);
 });
 
-test("turn card combines live output and run details in one reply card", async () => {
+test("overlapping final card flushes reserve the final response before sending", async () => {
+  const telegram = new DelayedEditTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("hello"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    turn: {
+      id: "turn-1",
+    },
+  });
+
+  telegram.delayEdits = true;
+  const finalItem = bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Race final.",
+      phase: "final",
+    },
+  });
+  await waitForCondition(() => telegram.editWaiters.length >= 1);
+
+  const completedTurn = bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+    },
+  });
+  await waitForCondition(() => telegram.editWaiters.length >= 2);
+
+  telegram.delayEdits = false;
+  telegram.releaseEdits();
+  await Promise.all([finalItem, completedTurn]);
+
+  const finalMessages = telegram.sentMessages.filter((message) => message.text === "Race final.");
+  assert.equal(finalMessages.length, 1);
+  assert.equal(finalMessages[0]!.replyToMessageId, 1);
+});
+
+test("turn card keeps run details above a fresh final answer message", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
@@ -414,11 +511,13 @@ test("turn card combines live output and run details in one reply card", async (
   });
   const afterToolEdit = telegram.editedMessages.at(-1)!;
   assert.equal(afterToolEdit.messageId, 1);
-  assert.match(afterToolEdit.text, /^Tool: Command completed, exit 0: pnpm test/);
+  assert.match(afterToolEdit.text, /^Command completed, exit 0: pnpm test/);
   assert.match(afterToolEdit.text, /<blockquote expandable>/);
   assert.match(afterToolEdit.text, /Run details/);
-  assert.match(afterToolEdit.text, /Preamble:/);
-  assert.match(afterToolEdit.text, /Tool:/);
+  assert.match(afterToolEdit.text, /I will inspect the Telegram bridge\./);
+  assert.match(afterToolEdit.text, /Command completed, exit 0: pnpm test/);
+  assert.doesNotMatch(afterToolEdit.text, /Preamble:/);
+  assert.doesNotMatch(afterToolEdit.text, /Tool:/);
   await bridge.handleNotificationForTest("item/completed", {
     threadId: "thread-1",
     turnId: "turn-1",
@@ -437,23 +536,163 @@ test("turn card combines live output and run details in one reply card", async (
     },
   });
 
-  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /<blockquote expandable>/);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^Thinking/);
+  assert.match(telegram.sentMessages[0]!.text, /^<b>T<\/b>hinking\n/);
+  assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
+  assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
+  assert.equal(telegram.sentMessages[1]!.text, "Done.");
   assert.ok(telegram.editedMessages.length >= 1);
   const finalEdit = telegram.editedMessages.at(-1)!;
   assert.equal(finalEdit.messageId, 1);
-  assert.match(finalEdit.text, /^Done\./);
   assert.match(finalEdit.text, /<blockquote expandable>/);
   assert.match(finalEdit.text, /Run details/);
-  assert.match(finalEdit.text, /Preamble:/);
-  assert.match(finalEdit.text, /Tool:/);
+  assert.match(finalEdit.text, /I will inspect the Telegram bridge\./);
+  assert.match(finalEdit.text, /Command completed, exit 0: pnpm test/);
+  assert.doesNotMatch(finalEdit.text, /Preamble:/);
+  assert.doesNotMatch(finalEdit.text, /Tool:/);
   assert.match(finalEdit.text, /pnpm test/);
+  assert.doesNotMatch(finalEdit.text, /^Done\./);
   assert.doesNotMatch(finalEdit.text, /Working on:/);
   assert.doesNotMatch(finalEdit.text, /Current:/);
+});
+
+test("queued turn cards reply to the queued Telegram request", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  let startedTurnCount = 0;
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    if (method === "thread/read") {
+      return {
+        thread: {
+          id: "thread-1",
+          status: { type: "active" },
+          turns: [{ id: "turn-1", status: "inProgress" }],
+        },
+      };
+    }
+    if (method === "thread/resume") {
+      return {};
+    }
+    if (method === "turn/start") {
+      startedTurnCount += 1;
+      return { turn: { id: `turn-${startedTurnCount + 1}` } };
+    }
+    throw new Error(`unexpected codex call: ${method}`);
+  };
+  const state = testState();
+  state.chats["42"] = testChatState({
+    threadId: "thread-1",
+    activeTurnId: "turn-1",
+  });
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("queued follow-up", 7));
+  const queueCallbackData = (telegram.sentMessages[0]!.replyMarkup as { inline_keyboard: Array<Array<{ callback_data?: string }>> })
+    .inline_keyboard[0]![1]!.callback_data!;
+  await bridge.handleUpdateForTest(telegramCallbackUpdate(queueCallbackData));
+
+  assert.equal(state.chats["42"]!.queuedTurnOriginMessageId, 7);
+  assert.match(telegram.sentMessages[0]!.text, /queued follow-up/);
+  assert.equal(telegram.sentMessages[0]!.replyToMessageId, 7);
+  assert.match(telegram.sentMessages[1]!.text, /Queued/);
+  assert.equal(telegram.sentMessages[1]!.replyToMessageId, 7);
+
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-2",
+    },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-2",
+    item: {
+      id: "final-2",
+      type: "agentMessage",
+      text: "Queued response.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-2",
+      status: "completed",
+    },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-2",
+    item: {
+      id: "final-2",
+      type: "agentMessage",
+      text: "Queued response.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-2",
+      status: "completed",
+    },
+  });
+
+  const queuedDetailsCards = telegram.sentMessages.filter((message) =>
+    message.replyToMessageId === 7 && /Run details/.test(message.text)
+  );
+  const queuedFinalCards = telegram.sentMessages.filter((message) =>
+    message.replyToMessageId === 7 && message.text === "Queued response."
+  );
+  assert.equal(queuedDetailsCards.length, 1);
+  assert.equal(queuedFinalCards.length, 1);
+});
+
+test("polled updates are acknowledged only after handling succeeds", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-polled-update-"));
+  const state = testState();
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.call = async function (method: string, params?: JsonObject): Promise<JsonObject> {
+    this.calls.push({ method, params });
+    throw new Error(`boom during ${method}`);
+  };
+  const bridge = new CodexAnywhereBridge(
+    testConfig(),
+    path.join(tempDir, "config.json"),
+    path.join(tempDir, "state.json"),
+    {
+      telegram,
+      codex,
+      initialState: state,
+    },
+  );
+
+  await assert.rejects(
+    bridge.handlePolledUpdateForTest(telegramMessageUpdate("start a failing turn", 10)),
+    /boom during thread\/start/,
+  );
+  assert.equal(state.lastUpdateId, null);
+
+  await bridge.handlePolledUpdateForTest(telegramMessageUpdate("/version", 11));
+  assert.equal(state.lastUpdateId, 11);
+  assert.match(telegram.sentMessages.at(-1)?.text ?? "", /^codex-anywhere /);
 });
 
 test("bridge routes /computer through the Computer Use plugin mention", async () => {
@@ -509,7 +748,9 @@ test("bridge queues /computer input through the normal active-turn path", async 
   assert.deepEqual(codex.calls.map((call) => call.method), ["thread/read"]);
   assert.equal(state.chats["42"]!.queueNextArmed, false);
   assert.deepEqual(state.chats["42"]!.queuedTurnInput, computerUseInput("play a music"));
+  assert.equal(state.chats["42"]!.queuedTurnOriginMessageId, 1);
   assert.match(telegram.sentMessages[0]!.text, /Queued/);
+  assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
 });
 
 test("bridge shows /computer usage when task is missing", async () => {
@@ -1570,11 +1811,13 @@ test("/version reports the installed package version", async () => {
   assert.match(telegram.sentMessages[0]!.text, /^codex-anywhere \d+\.\d+\.\d+/);
 });
 
-test("/upgrade installs latest package and schedules a detached official service restart", async () => {
+test("/upgrade installs latest package and schedules a supervised official service restart", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-install-"));
+  const config = testConfig();
   const execCalls: Array<{ file: string; args: string[]; cwd?: string }> = [];
-  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+  const bridge = new CodexAnywhereBridge(config, path.join(tempDir, "config.json"), path.join(tempDir, "state.json"), {
     telegram,
     codex,
     initialState: testState(),
@@ -1589,7 +1832,7 @@ test("/upgrade installs latest package and schedules a detached official service
       if (file === process.execPath) {
         return { stdout: "codex-anywhere 0.3.15\n", stderr: "" };
       }
-      return { stdout: "restarted\n", stderr: "" };
+      return { stdout: "scheduled\n", stderr: "" };
     },
   });
 
@@ -1599,47 +1842,167 @@ test("/upgrade installs latest package and schedules a detached official service
     {
       file: "npm",
       args: ["install", "-g", "codex-anywhere@latest"],
-      cwd: testConfig().workspaceCwd,
+      cwd: config.workspaceCwd,
     },
   ]);
   assert.deepEqual(execCalls[1], {
     file: "npm",
     args: ["root", "-g"],
-    cwd: testConfig().workspaceCwd,
+    cwd: config.workspaceCwd,
   });
   assert.deepEqual(execCalls[2], {
     file: process.execPath,
     args: ["/opt/homebrew/lib/node_modules/codex-anywhere/dist/cli.js", "--version"],
-    cwd: testConfig().workspaceCwd,
+    cwd: config.workspaceCwd,
   });
   assert.equal(execCalls.length, 4);
   assert.equal(execCalls[3]!.file, "sh");
   assert.deepEqual(execCalls[3]!.args.slice(0, 1), ["-c"]);
   const restartCommand = execCalls[3]!.args[1]!;
-  assert.match(restartCommand, /mkdir -p '\/tmp\/logs' && nohup sh -c 'sleep 3\nexport CODEX_ANYWHERE_HOME=/);
   assert.match(restartCommand, /codex-anywhere\/dist\/cli\.js/);
   assert.match(restartCommand, /codex-anywhere restart-service attempt/);
   assert.match(restartCommand, /codex-anywhere restart-service succeeded/);
   assert.match(restartCommand, /codex-anywhere install-service attempt/);
   assert.match(restartCommand, /codex-anywhere install-service succeeded/);
   assert.match(restartCommand, /upgrade-restart\.log/);
+  assert.match(restartCommand, /upgrade-events\.jsonl/);
+  assert.match(restartCommand, /upgrade-state\.json/);
+  assert.match(restartCommand, /append_upgrade_event helper-started/);
+  assert.match(restartCommand, /export PATH=/);
+  assert.match(restartCommand, /upgrade-restart-watchdog-/);
+  assert.match(restartCommand, /upgrade watchdog marker observed/);
+  assert.match(restartCommand, /Upgrade restart did not become reachable/);
+  assert.match(restartCommand, /Diagnostics: (?:<|&lt;)code/);
+  assert.doesNotMatch(restartCommand, /test-token/);
+  if (process.platform === "darwin") {
+    assert.match(restartCommand, /launchctl bootstrap/);
+    assert.match(restartCommand, /ai\.mempat\.codex-anywhere\.upgrade-restart/);
+    assert.doesNotMatch(restartCommand, /nohup sh -c 'sleep 3/);
+  } else if (process.platform === "linux") {
+    assert.match(restartCommand, /systemd-run --user/);
+    assert.match(restartCommand, /codex-anywhere-upgrade-restart/);
+    assert.match(restartCommand, /command -v systemd-run/);
+  } else {
+    assert.match(restartCommand, /nohup sh -c/);
+  }
   assert.doesNotMatch(restartCommand, /\n  if codex-anywhere restart-service/);
   assert.doesNotMatch(restartCommand, /do;/);
   assert.doesNotMatch(restartCommand, /then;/);
-  assert.equal(execCalls[3]!.cwd, testConfig().workspaceCwd);
+  assert.equal(execCalls[3]!.cwd, config.workspaceCwd);
   assert.equal(telegram.sentMessages.length, 2);
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /Upgrade started/);
+  assert.match(telegram.sentMessages[0]!.text, /Diagnostics:/);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
   assert.match(telegram.sentMessages[1]!.text, /codex-anywhere 0\.3\.15/);
-  assert.match(telegram.sentMessages[1]!.text, /detached service restart/);
+  assert.match(telegram.sentMessages[1]!.text, /supervised service restart/);
+  assert.match(telegram.sentMessages[1]!.text, /automatic completion message/);
+  assert.match(telegram.sentMessages[1]!.text, /helper will send a failure message/);
+  assert.match(telegram.sentMessages[1]!.text, /upgrade-state\.json/);
+  assert.match(telegram.sentMessages[1]!.text, /upgrade-events\.jsonl/);
+  assert.match(telegram.sentMessages[1]!.text, /upgrade-restart\.log/);
+  const diagnosticStatePath = path.join(tempDir, "logs", "upgrade-state.json");
+  const diagnosticJournalPath = path.join(tempDir, "logs", "upgrade-events.jsonl");
+  const diagnosticState = JSON.parse(await fs.readFile(diagnosticStatePath, "utf8")) as JsonObject;
+  const latest = diagnosticState.latest as JsonObject;
+  assert.equal(latest.event, "upgrade-helper-scheduled");
+  assert.equal(latest.targetVersionLine, "codex-anywhere 0.3.15");
+  assert.equal(diagnosticState.journalPath, diagnosticJournalPath);
+  const journal = (await fs.readFile(diagnosticJournalPath, "utf8")).trim().split("\n")
+    .map((line) => JSON.parse(line) as JsonObject);
+  assert.deepEqual(journal.map((entry) => entry.event), [
+    "upgrade-started",
+    "upgrade-installed",
+    "upgrade-helper-scheduled",
+  ]);
+  assert.ok(journal.every((entry) => !JSON.stringify(entry).includes("test-token")));
+});
+
+test("startup sends pending upgrade completion from the restarted process", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-complete-"));
+  const state = testState();
+  const markerPath = path.join(tempDir, "upgrade-watchdog.ok");
+  state.pendingUpgradeNotification = {
+    chatId: 42,
+    fromVersion: "0.3.19",
+    targetVersionLine: "codex-anywhere 0.3.20",
+    startedAt: Date.now(),
+    failureNotifiedAt: null,
+    watchdogMarkerPath: markerPath,
+  };
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig(),
+    path.join(tempDir, "config.json"),
+    path.join(tempDir, "state.json"),
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: state,
+    },
+  );
+
+  await bridge.initialize({ printStartupHelp: false });
+
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
+  assert.match(telegram.sentMessages[0]!.text, /Upgrade completed/);
+  assert.match(telegram.sentMessages[0]!.text, /The restarted service reached Telegram successfully/);
+  assert.match(telegram.sentMessages[0]!.text, /Diagnostics:/);
+  assert.equal(state.pendingUpgradeNotification, null);
+  assert.match(await fs.readFile(markerPath, "utf8"), /^completed /);
+  assert.match(await fs.readFile(path.join(tempDir, "logs", "upgrade-events.jsonl"), "utf8"), /upgrade-completed/);
+});
+
+test("startup reports pending upgrade failure when Codex initialization fails", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-failed-"));
+  const state = testState();
+  const markerPath = path.join(tempDir, "upgrade-watchdog.ok");
+  state.pendingUpgradeNotification = {
+    chatId: 42,
+    fromVersion: "0.3.19",
+    targetVersionLine: "codex-anywhere 0.3.20",
+    startedAt: Date.now(),
+    failureNotifiedAt: null,
+    watchdogMarkerPath: markerPath,
+  };
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.start = async function (): Promise<void> {
+    throw new Error("codex was not found on PATH");
+  };
+  const bridge = new CodexAnywhereBridge(
+    testConfig(),
+    path.join(tempDir, "config.json"),
+    path.join(tempDir, "state.json"),
+    {
+      telegram,
+      codex,
+      initialState: state,
+    },
+  );
+
+  await assert.rejects(
+    bridge.initialize({ printStartupHelp: false }),
+    /codex was not found on PATH/,
+  );
+
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
+  assert.match(telegram.sentMessages[0]!.text, /Upgrade restart failed/);
+  assert.match(telegram.sentMessages[0]!.text, /codex was not found on PATH/);
+  assert.match(telegram.sentMessages[0]!.text, /Diagnostics:/);
+  assert.equal(typeof state.pendingUpgradeNotification?.failureNotifiedAt, "number");
+  assert.match(await fs.readFile(markerPath, "utf8"), /^startup-failed /);
+  assert.match(await fs.readFile(path.join(tempDir, "logs", "upgrade-events.jsonl"), "utf8"), /upgrade-startup-failed/);
 });
 
 test("/upgrade reports installed CLI verification failures", async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-verify-failed-"));
   const execCalls: string[] = [];
-  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+  const bridge = new CodexAnywhereBridge(testConfig(), path.join(tempDir, "config.json"), path.join(tempDir, "state.json"), {
     telegram,
     codex,
     initialState: testState(),
@@ -1665,6 +2028,41 @@ test("/upgrade reports installed CLI verification failures", async () => {
   assert.equal(telegram.sentMessages.length, 2);
   assert.match(telegram.sentMessages[1]!.text, /Upgrade failed/);
   assert.match(telegram.sentMessages[1]!.text, /did not report a valid version/);
+  assert.match(telegram.sentMessages[1]!.text, /Diagnostics:/);
+  assert.match(await fs.readFile(path.join(tempDir, "logs", "upgrade-events.jsonl"), "utf8"), /upgrade-failed/);
+});
+
+test("/upgrade test runs the supervised restart probe without installing", async () => {
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-test-"));
+  const execCalls: Array<{ file: string; args: string[] }> = [];
+  const bridge = new CodexAnywhereBridge(testConfig(), path.join(tempDir, "config.json"), path.join(tempDir, "state.json"), {
+    telegram,
+    codex,
+    initialState: testState(),
+    execFile: async (file, args) => {
+      execCalls.push({ file, args });
+      assert.equal(file, "sh");
+      const command = args[1] ?? "";
+      const markerMatch = /([/\w.-]+upgrade-restart-test-([a-f0-9]+)\.ok)/.exec(command);
+      assert.ok(markerMatch);
+      await fs.mkdir(path.dirname(markerMatch[1]!), { recursive: true });
+      await fs.writeFile(markerMatch[1]!, markerMatch[2]!, "utf8");
+      return { stdout: "", stderr: "" };
+    },
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("/upgrade test"));
+
+  assert.equal(execCalls.length, 1);
+  const restartCommand = execCalls[0]!.args[1]!;
+  assert.match(restartCommand, /upgrade-restart-test/);
+  assert.doesNotMatch(restartCommand, /npm install/);
+  assert.equal(telegram.sentMessages.length, 2);
+  assert.match(telegram.sentMessages[0]!.text, /Upgrade self-test started/);
+  assert.match(telegram.sentMessages[1]!.text, /Upgrade self-test passed/);
+  assert.match(telegram.sentMessages[1]!.text, /supervised helper ran/);
 });
 
 test("/upgrade rejects arguments", async () => {
@@ -1684,7 +2082,7 @@ test("/upgrade rejects arguments", async () => {
   await bridge.handleUpdateForTest(telegramMessageUpdate("/upgrade 0.3.3"));
 
   assert.deepEqual(execCalls, []);
-  assert.equal(telegram.sentMessages[0]!.text, "Usage: /upgrade");
+  assert.equal(telegram.sentMessages[0]!.text, "Usage: /upgrade\n/upgrade test");
 });
 
 test("/upgrade reports install failures", async () => {

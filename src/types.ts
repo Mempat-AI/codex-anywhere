@@ -54,7 +54,9 @@ export interface ChatSessionState {
   verbose: boolean;
   queueNextArmed: boolean;
   queuedTurnInput: JsonObject[] | null;
+  queuedTurnOriginMessageId: number | null;
   pendingTurnInput: JsonObject[] | null;
+  pendingTurnOriginMessageId: number | null;
   pendingMention: JsonObject | null;
   model: string | null;
   reasoningEffort: string | null;
@@ -67,9 +69,22 @@ export interface ChatSessionState {
   lastAssistantMessage: string | null;
 }
 
+export interface PendingUpgradeNotification {
+  chatId: number;
+  fromVersion: string;
+  targetVersionLine: string;
+  startedAt: number;
+  failureNotifiedAt: number | null;
+  attemptId?: string | null;
+  diagnosticJournalPath?: string | null;
+  diagnosticStatePath?: string | null;
+  watchdogMarkerPath?: string | null;
+}
+
 export interface StoredState {
   version: 1;
   lastUpdateId: number | null;
+  pendingUpgradeNotification?: PendingUpgradeNotification | null;
   chats: Record<string, ChatSessionState>;
 }
 
