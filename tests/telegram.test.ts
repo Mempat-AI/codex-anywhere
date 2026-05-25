@@ -62,7 +62,7 @@ test("sendMessage retries once after Telegram retry_after", async () => {
   }
 });
 
-test("editMessageText can skip blocking retry for animation updates", async () => {
+test("editMessageText can skip blocking retry for best-effort updates", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
   globalThis.fetch = async () => {
@@ -83,6 +83,42 @@ test("editMessageText can skip blocking retry for animation updates", async () =
       /Too Many Requests/,
     );
     assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("nonblocking rate limits still cool down later Telegram requests", async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  let getMeStartedAt = 0;
+  globalThis.fetch = async (input) => {
+    calls += 1;
+    if (String(input).endsWith("/editMessageText")) {
+      return Response.json(
+        {
+          ok: false,
+          description: "Too Many Requests: retry after 0.03",
+          parameters: { retry_after: 0.03 },
+        },
+        { status: 429 },
+      );
+    }
+    getMeStartedAt = Date.now();
+    return Response.json({ ok: true, result: { id: 1, is_bot: true, first_name: "bot" } });
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    await assert.rejects(
+      api.editMessageText(42, 1, "Thinking", undefined, "HTML", { retry: false }),
+      /Too Many Requests/,
+    );
+
+    const beforeGetMe = Date.now();
+    await api.getMe();
+
+    assert.equal(calls, 2);
+    assert.ok(getMeStartedAt - beforeGetMe >= 20);
   } finally {
     globalThis.fetch = originalFetch;
   }
