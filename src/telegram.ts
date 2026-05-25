@@ -1,11 +1,29 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import type { TelegramParseMode } from "./telegramFormatting.js";
 import type { JsonObject, TelegramBotCommand, TelegramUpdate } from "./types.js";
 
+const TELEGRAM_RATE_LIMIT_RETRIES = 1;
+
+export class TelegramApiError extends Error {
+  readonly retryAfterSeconds: number | null;
+
+  constructor(message: string, retryAfterSeconds: number | null = null) {
+    super(message);
+    this.name = "TelegramApiError";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+interface TelegramRequestOptions {
+  retry?: boolean;
+}
+
 export class TelegramBotApi {
   readonly #baseUrl: string;
+  #retryAfterUntil = 0;
 
   constructor(token: string) {
     this.#baseUrl = `https://api.telegram.org/bot${token}`;
@@ -94,6 +112,7 @@ export class TelegramBotApi {
     text: string,
     replyMarkup?: JsonObject,
     parseMode?: TelegramParseMode,
+    options?: TelegramRequestOptions,
   ): Promise<void> {
     const payload: JsonObject = {
       chat_id: chatId,
@@ -107,7 +126,7 @@ export class TelegramBotApi {
       payload.parse_mode = parseMode;
     }
     try {
-      await this.#request("editMessageText", payload);
+      await this.#request("editMessageText", payload, options);
     } catch (error) {
       if (error instanceof Error && error.message.includes("message is not modified")) {
         return;
@@ -131,23 +150,17 @@ export class TelegramBotApi {
     });
   }
 
-  async #request(method: string, payload: JsonObject): Promise<unknown> {
-    const response = await fetch(`${this.#baseUrl}/${method}`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-    const body = (await response.json()) as {
-      ok: boolean;
-      description?: string;
-      result?: unknown;
-    };
-    if (!response.ok || !body.ok) {
-      throw new Error(body.description ?? `Telegram request failed for ${method}`);
-    }
-    return body.result;
+  async #request(method: string, payload: JsonObject, options?: TelegramRequestOptions): Promise<unknown> {
+    return this.#withRetry(method, async () => {
+      const response = await fetch(`${this.#baseUrl}/${method}`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+      return readTelegramApiResponse(response, method);
+    }, options);
   }
 
   async #uploadFile(
@@ -158,25 +171,99 @@ export class TelegramBotApi {
     caption?: string,
   ): Promise<unknown> {
     const bytes = await fs.readFile(filePath);
-    const form = new FormData();
-    form.append("chat_id", String(chatId));
-    if (caption) {
-      form.append("caption", caption);
-    }
-    form.append(fieldName, new Blob([bytes]), path.basename(filePath));
+    return this.#withRetry(method, async () => {
+      const form = new FormData();
+      form.append("chat_id", String(chatId));
+      if (caption) {
+        form.append("caption", caption);
+      }
+      form.append(fieldName, new Blob([bytes]), path.basename(filePath));
 
-    const response = await fetch(`${this.#baseUrl}/${method}`, {
-      method: "POST",
-      body: form,
+      const response = await fetch(`${this.#baseUrl}/${method}`, {
+        method: "POST",
+        body: form,
+      });
+      return readTelegramApiResponse(response, method);
     });
-    const body = (await response.json()) as {
-      ok: boolean;
-      description?: string;
-      result?: unknown;
-    };
-    if (!response.ok || !body.ok) {
-      throw new Error(body.description ?? `Telegram request failed for ${method}`);
-    }
-    return body.result;
   }
+
+  async #withRetry(
+    method: string,
+    send: () => Promise<unknown>,
+    options?: TelegramRequestOptions,
+  ): Promise<unknown> {
+    const shouldRetry = options?.retry ?? true;
+    for (let attempt = 0; ; attempt += 1) {
+      const gateDelayMs = this.#retryAfterUntil - Date.now();
+      if (gateDelayMs > 0) {
+        if (!shouldRetry) {
+          throw new TelegramApiError(
+            `Too Many Requests: retry after ${Math.ceil(gateDelayMs / 1000)}`,
+            Math.ceil(gateDelayMs / 1000),
+          );
+        }
+        await sleep(gateDelayMs);
+      }
+      try {
+        return await send();
+      } catch (error) {
+        const retryAfterMs = telegramRetryAfterMs(error);
+        if (retryAfterMs === null || !shouldRetry || attempt >= TELEGRAM_RATE_LIMIT_RETRIES) {
+          throw error;
+        }
+        this.#retryAfterUntil = Math.max(this.#retryAfterUntil, Date.now() + retryAfterMs);
+        await sleep(retryAfterMs);
+      }
+    }
+  }
+}
+
+async function readTelegramApiResponse(response: Response, method: string): Promise<unknown> {
+  const body = (await response.json()) as {
+    ok: boolean;
+    description?: string;
+    result?: unknown;
+    parameters?: {
+      retry_after?: number;
+    };
+  };
+  if (!response.ok || !body.ok) {
+    throw new TelegramApiError(
+      body.description ?? `Telegram request failed for ${method}`,
+      telegramRetryAfterSeconds(body),
+    );
+  }
+  return body.result;
+}
+
+function telegramRetryAfterSeconds(body: {
+  description?: string;
+  parameters?: { retry_after?: number };
+}): number | null {
+  const structured = body.parameters?.retry_after;
+  if (typeof structured === "number" && Number.isFinite(structured) && structured > 0) {
+    return structured;
+  }
+  const match = /\bretry after\s+(\d+(?:\.\d+)?)\b/i.exec(body.description ?? "");
+  if (!match) {
+    return null;
+  }
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : null;
+}
+
+function telegramRetryAfterMs(error: unknown): number | null {
+  const retryAfterSeconds = (error as { retryAfterSeconds?: unknown } | null)?.retryAfterSeconds;
+  if (typeof retryAfterSeconds === "number" && Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+    return Math.ceil(retryAfterSeconds * 1000);
+  }
+  if (!(error instanceof Error)) {
+    return null;
+  }
+  const match = /\bretry after\s+(\d+(?:\.\d+)?)\b/i.exec(error.message);
+  if (!match) {
+    return null;
+  }
+  const seconds = Number(match[1]);
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : null;
 }
