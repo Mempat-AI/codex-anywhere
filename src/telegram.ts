@@ -208,10 +208,12 @@ export class TelegramBotApi {
         return await send();
       } catch (error) {
         const retryAfterMs = telegramRetryAfterMs(error);
+        if (retryAfterMs !== null) {
+          this.#retryAfterUntil = Math.max(this.#retryAfterUntil, Date.now() + retryAfterMs);
+        }
         if (retryAfterMs === null || !shouldRetry || attempt >= TELEGRAM_RATE_LIMIT_RETRIES) {
           throw error;
         }
-        this.#retryAfterUntil = Math.max(this.#retryAfterUntil, Date.now() + retryAfterMs);
         await sleep(retryAfterMs);
       }
     }

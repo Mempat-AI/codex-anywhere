@@ -117,26 +117,6 @@ class DelayedEditTelegram extends FakeTelegram {
   }
 }
 
-class RateLimitedEditTelegram extends FakeTelegram {
-  failNextEdit = false;
-  editAttempts = 0;
-
-  override async editMessageText(
-    chatId: number,
-    messageId: number,
-    text: string,
-    replyMarkup?: JsonObject,
-    parseMode?: string,
-  ): Promise<void> {
-    this.editAttempts += 1;
-    if (this.failNextEdit) {
-      this.failNextEdit = false;
-      throw new Error("Too Many Requests: retry after 5");
-    }
-    await super.editMessageText(chatId, messageId, text, replyMarkup, parseMode);
-  }
-}
-
 class FakeCodex {
   readonly calls: Array<{ method: string; params?: JsonObject }> = [];
 
@@ -407,7 +387,7 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.equal(telegram.sentMessages.length, 1);
   assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^<b>T<\/b>hinking\n/);
+  assert.match(telegram.sentMessages[0]!.text, /^Thinking\n/);
   assert.equal(telegram.editedMessages.length, 1);
   assert.equal(telegram.editedMessages[0]!.messageId, 1);
 
@@ -482,8 +462,8 @@ test("overlapping final card flushes reserve the final response before sending",
   assert.equal(finalMessages[0]!.replyToMessageId, 1);
 });
 
-test("turn card animation backs off after Telegram rate limits", { concurrency: false }, async () => {
-  const telegram = new RateLimitedEditTelegram();
+test("turn card does not perform timer-driven status edits", async () => {
+  const telegram = new FakeTelegram();
   const codex = new FakeCodex();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
     telegram,
@@ -499,14 +479,9 @@ test("turn card animation backs off after Telegram rate limits", { concurrency: 
     },
   });
 
-  const setupEditAttempts = telegram.editAttempts;
-  telegram.failNextEdit = true;
-  await waitForCondition(() => telegram.editAttempts === setupEditAttempts + 1, 100, 50);
-
-  assert.equal(telegram.editAttempts, setupEditAttempts + 1);
-
-  await sleep(1000);
-  assert.equal(telegram.editAttempts, setupEditAttempts + 1);
+  const editCountAfterStart = telegram.editedMessages.length;
+  await sleep(700);
+  assert.equal(telegram.editedMessages.length, editCountAfterStart);
 });
 
 test("turn card keeps run details above a fresh final answer message", async () => {
@@ -587,7 +562,7 @@ test("turn card keeps run details above a fresh final answer message", async () 
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /<blockquote expandable>/);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^<b>T<\/b>hinking\n/);
+  assert.match(telegram.sentMessages[0]!.text, /^Thinking\n/);
   assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
   assert.equal(telegram.sentMessages[1]!.text, "Done.");

@@ -114,10 +114,8 @@ const COMPUTER_USE_MENTION_TOKEN = "@computer-use";
 const TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES = 10 * 1024 * 1024;
 const TELEGRAM_DOCUMENT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
 const DOWNLOAD_LIST_LIMIT = 50;
-const TURN_STATUS_ANIMATION_INTERVAL_MS = 500;
-const TURN_STATUS_ANIMATION_EDIT_DELAYS_MS = [500, 1000, 1500, 2000] as const;
-const TURN_STATUS_BOLD_STEP = 3;
-const TURN_STATUS_DOT_FRAMES = ["", ".", "..", "..."] as const;
+const TELEGRAM_POLL_ERROR_FALLBACK_DELAY_MS = 1000;
+const TELEGRAM_RETRY_AFTER_PADDING_MS = 250;
 
 type TelegramClient = Pick<
   TelegramBotApi,
@@ -155,12 +153,10 @@ interface TurnCard {
   detailsMessageId: number | null;
   originMessageId: number | null;
   currentStatus: string;
-  statusAnimationFrame: number;
   finalText: string | null;
   trace: TurnTraceEntry[];
   lastEditAt: number;
   flushInFlight: Promise<void> | null;
-  animationBackoffUntil: number;
   finalized: boolean;
   finalSent: boolean;
 }
@@ -206,7 +202,6 @@ export class CodexAnywhereBridge {
   readonly #pendingChatOrigins = new Map<number, PendingTurnOrigin>();
   readonly #pendingTurnOrigins = new Map<string, PendingTurnOrigin>();
   readonly #turnCards = new Map<string, TurnCard>();
-  readonly #turnCardAnimationIntervals = new Map<string, ReturnType<typeof setInterval>>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
   readonly #finalizedTurnKeys = new Set<string>();
   readonly #finalizedTurnKeyOrder: string[] = [];
@@ -306,7 +301,12 @@ export class CodexAnywhereBridge {
         }
       } catch (error) {
         this.#logRuntimeError("telegram poll", error);
-        await sleep(1000);
+        const retryAfterMs = telegramRetryAfterMs(error);
+        await sleep(
+          retryAfterMs === null
+            ? TELEGRAM_POLL_ERROR_FALLBACK_DELAY_MS
+            : retryAfterMs + TELEGRAM_RETRY_AFTER_PADDING_MS,
+        );
       }
     }
   }
@@ -3800,18 +3800,15 @@ export class CodexAnywhereBridge {
       detailsMessageId: null,
       originMessageId: origin?.originMessageId ?? null,
       currentStatus: "Thinking",
-      statusAnimationFrame: 0,
       finalText: null,
       trace: [],
       lastEditAt: 0,
       flushInFlight: null,
-      animationBackoffUntil: 0,
       finalized: false,
       finalSent: false,
     };
     this.#turnCards.set(key, card);
     await this.#flushTurnCard(card, { force: true });
-    this.#startTurnCardAnimation(card);
     return card;
   }
 
@@ -3842,57 +3839,7 @@ export class CodexAnywhereBridge {
   #setTurnCardStatus(card: TurnCard, status: string): void {
     if (card.currentStatus !== status) {
       card.currentStatus = status;
-      card.statusAnimationFrame = 0;
     }
-    if (isAnimatedTurnStatus(status) && !card.finalized) {
-      this.#startTurnCardAnimation(card);
-    } else {
-      this.#stopTurnCardAnimation(turnKey(card.threadId, card.turnId));
-    }
-  }
-
-  #startTurnCardAnimation(card: TurnCard): void {
-    const key = turnKey(card.threadId, card.turnId);
-    if (this.#turnCardAnimationIntervals.has(key)) {
-      return;
-    }
-
-    const interval = setInterval(() => {
-      void this.#advanceTurnCardAnimation(key).catch((error) => {
-        this.#logRuntimeError("animate turn card", error);
-      });
-    }, TURN_STATUS_ANIMATION_INTERVAL_MS);
-    interval.unref?.();
-    this.#turnCardAnimationIntervals.set(key, interval);
-  }
-
-  async #advanceTurnCardAnimation(key: string): Promise<void> {
-    const card = this.#turnCards.get(key);
-    if (!card || card.finalized || !isAnimatedTurnStatus(card.currentStatus)) {
-      this.#stopTurnCardAnimation(key);
-      return;
-    }
-    const now = Date.now();
-    if (
-      card.flushInFlight
-      || now < card.animationBackoffUntil
-      || now - card.lastEditAt < turnStatusAnimationEditDelayMs(card)
-    ) {
-      return;
-    }
-
-    card.statusAnimationFrame =
-      card.statusAnimationFrame >= Number.MAX_SAFE_INTEGER ? 0 : card.statusAnimationFrame + 1;
-    await this.#flushTurnCard(card, { force: true, animation: true });
-  }
-
-  #stopTurnCardAnimation(key: string): void {
-    const interval = this.#turnCardAnimationIntervals.get(key);
-    if (!interval) {
-      return;
-    }
-    clearInterval(interval);
-    this.#turnCardAnimationIntervals.delete(key);
   }
 
   #addTurnTrace(card: TurnCard, label: string, text: string): void {
@@ -3934,7 +3881,6 @@ export class CodexAnywhereBridge {
     this.#pendingTurnOrigins.delete(turnKey(threadId, turnId));
     this.#pendingChatOrigins.delete(chatId);
     const key = turnKey(threadId, turnId);
-    this.#stopTurnCardAnimation(key);
     this.#turnCards.delete(key);
     this.#rememberFinalizedTurnKey(key);
   }
@@ -3956,35 +3902,13 @@ export class CodexAnywhereBridge {
     }
   }
 
-  async #flushTurnCard(card: TurnCard, options: { force: boolean; animation?: boolean }): Promise<void> {
-    if (options.animation && card.flushInFlight) {
-      return;
-    }
-
+  async #flushTurnCard(card: TurnCard, options: { force: boolean }): Promise<void> {
     const previousFlush = card.flushInFlight;
     const flush = (async () => {
       if (previousFlush) {
         await previousFlush.catch(() => undefined);
       }
-      if (options.animation && Date.now() < card.animationBackoffUntil) {
-        return;
-      }
-      try {
-        await this.#flushTurnCardNow(card, options);
-      } catch (error) {
-        const retryAfterMs = telegramRetryAfterMs(error);
-        if (retryAfterMs !== null) {
-          card.animationBackoffUntil = Date.now() + retryAfterMs;
-          if (options.animation) {
-            this.#logRuntimeError(
-              "animate turn card",
-              new Error(`Telegram rate limited turn-card animation; pausing for ${Math.ceil(retryAfterMs / 1000)}s`),
-            );
-            return;
-          }
-        }
-        throw error;
-      }
+      await this.#flushTurnCardNow(card, options);
     })();
     card.flushInFlight = flush;
     try {
@@ -3996,7 +3920,7 @@ export class CodexAnywhereBridge {
     }
   }
 
-  async #flushTurnCardNow(card: TurnCard, options: { force: boolean; animation?: boolean }): Promise<void> {
+  async #flushTurnCardNow(card: TurnCard, options: { force: boolean }): Promise<void> {
     const now = Date.now();
     if (!options.force && now - card.lastEditAt < this.#config.streamEditIntervalMs) {
       return;
@@ -4019,7 +3943,6 @@ export class CodexAnywhereBridge {
         detailsHtml,
         undefined,
         "HTML",
-        { retry: !options.animation },
       );
     }
 
@@ -4775,41 +4698,7 @@ function renderTurnDetailsCardHtml(card: TurnCard): string {
 }
 
 function renderTurnStatusHtml(card: TurnCard): string {
-  const status = truncatePlain(card.currentStatus, 1400);
-  if (!isAnimatedTurnStatus(card.currentStatus)) {
-    return escapeTelegramHtml(status);
-  }
-  const frame = TURN_STATUS_DOT_FRAMES[card.statusAnimationFrame % TURN_STATUS_DOT_FRAMES.length] ?? "";
-  const suffix = frame ? ` ${frame}` : "";
-  return `${renderSweepingBoldHtml(status, card.statusAnimationFrame)}${escapeTelegramHtml(suffix)}`;
-}
-
-function isAnimatedTurnStatus(status: string): boolean {
-  return status === "Thinking" || status === "Writing final answer";
-}
-
-function turnStatusAnimationEditDelayMs(card: TurnCard): number {
-  return TURN_STATUS_ANIMATION_EDIT_DELAYS_MS[
-    card.statusAnimationFrame % TURN_STATUS_ANIMATION_EDIT_DELAYS_MS.length
-  ] ?? TURN_STATUS_ANIMATION_EDIT_DELAYS_MS[0];
-}
-
-function renderSweepingBoldHtml(text: string, frame: number): string {
-  const chars = Array.from(text);
-  const boldableIndexes = chars
-    .map((char, index) => ({ char, index }))
-    .filter(({ char }) => !/\s/.test(char))
-    .map(({ index }) => index);
-  const boldIndex = boldableIndexes[(frame * TURN_STATUS_BOLD_STEP) % boldableIndexes.length];
-  if (boldIndex === undefined) {
-    return escapeTelegramHtml(text);
-  }
-  return chars
-    .map((char, index) => {
-      const escaped = escapeTelegramHtml(char);
-      return index === boldIndex ? `<b>${escaped}</b>` : escaped;
-    })
-    .join("");
+  return escapeTelegramHtml(truncatePlain(card.currentStatus, 1400));
 }
 
 function buildTurnFinalHtmlChunks(card: TurnCard): string[] {
@@ -5402,12 +5291,12 @@ function telegramRetryAfterMs(error: unknown): number | null {
   if (!(error instanceof Error)) {
     return null;
   }
-  const match = /\bretry after\s+(\d+)\b/i.exec(error.message);
+  const match = /\bretry after\s+(\d+(?:\.\d+)?)\b/i.exec(error.message);
   if (!match) {
     return null;
   }
   const seconds = Number(match[1]);
-  return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
+  return Number.isFinite(seconds) && seconds > 0 ? Math.ceil(seconds * 1000) : null;
 }
 
 function isLikelyImagePath(filePath: string): boolean {
