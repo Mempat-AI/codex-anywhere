@@ -95,11 +95,27 @@ Send a task to start a new Codex session, or use these commands:
 - `/reload` refreshes the current session
 - `/goal` shows or changes the current goal
 - `/account` shows, signs in, switches, or signs out of Codex
+- `/download <path>` sends a workspace file back to Telegram
 - `/upgrade` updates Codex Anywhere and relaunches the service
 - `/upgrade test` verifies that the supervised restart helper can run
 - `/esc` stops the active turn
 
 You can also send screenshots, photos, and files. Text files such as `.txt`, `.log`, `.json`, and `.crash` are sent as readable text so Codex can inspect them directly.
+
+While a turn is running, Telegram keeps progress and run details compact. When Codex finishes, the final answer is sent as a new message that quotes your original request, so it is easy to find and triggers normal Telegram notifications. Queued turns also quote the request they belong to.
+
+### Download files from the workspace
+
+Use `/download <path>` to send files created by Codex back to Telegram. Paths must stay inside the configured workspace or `/tmp`.
+
+```text
+/download <path>          choose the best Telegram format automatically
+/download file <path>     send as a file
+/download photo <path>    send an image as a Telegram photo
+/download zip <path>      send a file or folder as a zip archive
+/download list [path]     list files
+/download info <path>     show file details
+```
 
 For Oh-My-Codex, send `$deep-interview`, `$autopilot`, or other skills directly in chat. Use `/omx <args>` for OMX commands.
 
@@ -114,11 +130,14 @@ codex-anywhere uninstall-service
 ```
 
 Logs are written to `logs/` under the Codex Anywhere storage root (`CODEX_ANYWHERE_HOME`).
+Upgrade status is recorded there too: `upgrade-state.json`, `upgrade-events.jsonl`, and `upgrade-restart.log`.
 
 ## Telegram Commands
 
 | Command | Description |
 |---|---|
+| `/status` | Show current thread and model settings |
+| `/version` | Show the installed Codex Anywhere version |
 | `/workspace <path>` | Show or change the bot workspace |
 | `/addbot` | Add another Telegram bot |
 | `/resume` | Continue a session in this workspace |
@@ -126,13 +145,15 @@ Logs are written to `logs/` under the Codex Anywhere storage root (`CODEX_ANYWHE
 | `/reload` | Refresh the current session |
 | `/account [status\|login\|switch\|logout]` | Manage Codex sign-in |
 | `/goal [status\|set <objective>\|clear]` | Manage the current goal |
+| `/download [auto\|file\|photo\|zip\|list\|info] <path>` | Send workspace files to Telegram |
 | `/upgrade` | Upgrade Codex Anywhere |
 | `/upgrade test` | Test the upgrade restart helper without installing |
 | `/omx [args]` | Run Oh-My-Codex commands |
 | `/computer <task>` | Use Computer Use |
-| `/esc` | Interrupt the active turn |
+| `/interrupt`, `/esc` | Interrupt the active turn |
+| `/cancel` | Cancel the active prompt or picker |
 
-Many native Codex slash commands also work from Telegram, including `/model`, `/permissions`, `/sandbox`, `/review`, `/compact`, `/diff`, `/mention`, `/mcp`, `/apps`, and `/logout`.
+Many native Codex slash commands also work from Telegram, including `/model`, `/fast`, `/permissions`, `/sandbox`, `/review`, `/rename`, `/fork`, `/compact`, `/clear`, `/diff`, `/mention`, `/skills`, `/mcp`, `/apps`, `/plugins`, `/verbose`, `/logout`, and `/stop`.
 
 ## Development
 
