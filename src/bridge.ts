@@ -200,6 +200,8 @@ export class CodexAnywhereBridge {
   readonly #turnCards = new Map<string, TurnCard>();
   readonly #turnCardAnimationIntervals = new Map<string, ReturnType<typeof setInterval>>();
   readonly #typingIntervals = new Map<number, ReturnType<typeof setInterval>>();
+  readonly #finalizedTurnKeys = new Set<string>();
+  readonly #finalizedTurnKeyOrder: string[] = [];
   readonly #hasInitialState: boolean;
   #initialized = false;
   #state: StoredState = {
@@ -2864,6 +2866,9 @@ export class CodexAnywhereBridge {
         this.#items.set(item.id, item);
       }
       const turnId = asString(params.turnId);
+      if (threadId && turnId && this.#isTurnFinalized(threadId, turnId)) {
+        return;
+      }
       const chatId = threadId ? this.#findChatIdByThread(threadId) : null;
       if (threadId && turnId && chatId !== null && item) {
         const itemType = asString(item.type);
@@ -2911,6 +2916,9 @@ export class CodexAnywhereBridge {
       if (!turnId || !itemId || chatId === null) {
         return;
       }
+      if (this.#isTurnFinalized(threadId, turnId)) {
+        return;
+      }
       const stream = this.#getOrCreateAgentStream(threadId, turnId, chatId, itemId);
       stream.text += asString(params.delta) ?? "";
       await this.#flushStream(stream, false);
@@ -2923,6 +2931,9 @@ export class CodexAnywhereBridge {
       const item = params.item as JsonObject | undefined;
       const itemType = asString(item?.type);
       if (chatId === null || !turnId || !item || !itemType) {
+        return;
+      }
+      if (this.#isTurnFinalized(threadId, turnId)) {
         return;
       }
       if (itemType === "agentMessage") {
@@ -2974,6 +2985,9 @@ export class CodexAnywhereBridge {
       const turn = params.turn as JsonObject | undefined;
       const turnId = asString(turn?.id);
       if (chatId === null || !turn || !turnId) {
+        return;
+      }
+      if (this.#isTurnFinalized(threadId, turnId)) {
         return;
       }
       const state = this.#chatState(chatId);
@@ -3763,6 +3777,9 @@ export class CodexAnywhereBridge {
     errorMessage: string | null,
     fallbackHtml: string | null,
   ): Promise<void> {
+    if (this.#isTurnFinalized(threadId, turnId)) {
+      return;
+    }
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
     if (status !== "completed") {
       card.finalText = errorMessage ? `Turn ${status}: ${errorMessage}` : `Turn ${status}`;
@@ -3778,6 +3795,24 @@ export class CodexAnywhereBridge {
     const key = turnKey(threadId, turnId);
     this.#stopTurnCardAnimation(key);
     this.#turnCards.delete(key);
+    this.#rememberFinalizedTurnKey(key);
+  }
+
+  #isTurnFinalized(threadId: string, turnId: string): boolean {
+    return this.#finalizedTurnKeys.has(turnKey(threadId, turnId));
+  }
+
+  #rememberFinalizedTurnKey(key: string): void {
+    if (!this.#finalizedTurnKeys.has(key)) {
+      this.#finalizedTurnKeys.add(key);
+      this.#finalizedTurnKeyOrder.push(key);
+    }
+    while (this.#finalizedTurnKeyOrder.length > 500) {
+      const staleKey = this.#finalizedTurnKeyOrder.shift();
+      if (staleKey) {
+        this.#finalizedTurnKeys.delete(staleKey);
+      }
+    }
   }
 
   async #flushTurnCard(card: TurnCard, options: { force: boolean }): Promise<void> {

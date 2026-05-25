@@ -550,15 +550,32 @@ test("queued turn cards reply to the queued Telegram request", async () => {
       status: "completed",
     },
   });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-2",
+    item: {
+      id: "final-2",
+      type: "agentMessage",
+      text: "Queued response.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-2",
+      status: "completed",
+    },
+  });
 
-  const queuedDetailsCard = telegram.sentMessages.find((message) =>
+  const queuedDetailsCards = telegram.sentMessages.filter((message) =>
     message.replyToMessageId === 7 && /Run details/.test(message.text)
   );
-  const queuedFinalCard = telegram.sentMessages.find((message) =>
+  const queuedFinalCards = telegram.sentMessages.filter((message) =>
     message.replyToMessageId === 7 && message.text === "Queued response."
   );
-  assert.ok(queuedDetailsCard);
-  assert.ok(queuedFinalCard);
+  assert.equal(queuedDetailsCards.length, 1);
+  assert.equal(queuedFinalCards.length, 1);
 });
 
 test("polled updates are acknowledged only after handling succeeds", async () => {
