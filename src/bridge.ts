@@ -247,12 +247,18 @@ export class CodexAnywhereBridge {
     if (!this.#hasInitialState) {
       this.#state = await loadState(this.#statePath);
     }
-    await this.#codex.start();
-    await this.#codex.initialize();
+    try {
+      await this.#codex.start();
+      await this.#codex.initialize();
+    } catch (error) {
+      await this.#notifyPendingUpgradeStartupFailure(error);
+      throw error;
+    }
     if (options?.reconcilePersistedState ?? false) {
       await this.#reconcilePersistedThreads();
     }
     await this.#registerTelegramCommands();
+    await this.#sendPendingUpgradeCompletion();
     if (options?.printStartupHelp ?? true) {
       this.#printStartupHelp();
     }
@@ -3243,6 +3249,52 @@ export class CodexAnywhereBridge {
     await this.#sendText(chatId, `codex-anywhere ${packageJson.version}`);
   }
 
+  async #sendPendingUpgradeCompletion(): Promise<void> {
+    const pending = this.#state.pendingUpgradeNotification ?? null;
+    if (!pending) {
+      return;
+    }
+
+    try {
+      await this.#sendHtmlText(
+        pending.chatId,
+        [
+          "<b>Upgrade completed</b>",
+          `Now running <code>codex-anywhere ${escapeTelegramHtml(packageJson.version)}</code>.`,
+          `Installed target: <code>${escapeTelegramHtml(pending.targetVersionLine)}</code>.`,
+          "The restarted service reached Telegram successfully.",
+        ].join("\n"),
+      );
+      this.#state.pendingUpgradeNotification = null;
+      await this.#saveState();
+    } catch (error) {
+      this.#logRuntimeError("upgrade completion notification", error);
+    }
+  }
+
+  async #notifyPendingUpgradeStartupFailure(error: unknown): Promise<void> {
+    const pending = this.#state.pendingUpgradeNotification ?? null;
+    if (!pending || pending.failureNotifiedAt !== null) {
+      return;
+    }
+
+    try {
+      await this.#sendHtmlText(
+        pending.chatId,
+        [
+          "<b>Upgrade restart failed</b>",
+          `Installed target: <code>${escapeTelegramHtml(pending.targetVersionLine)}</code>.`,
+          "The service restarted but did not reach Codex initialization.",
+          `<code>${escapeTelegramHtml(formatErrorMessage(error))}</code>`,
+        ].join("\n"),
+      );
+      pending.failureNotifiedAt = Date.now();
+      await this.#saveState();
+    } catch (notifyError) {
+      this.#logRuntimeError("upgrade startup failure notification", notifyError);
+    }
+  }
+
   async #upgradeSelf(chatId: number, args: string): Promise<void> {
     const trimmedArgs = args.trim();
     if (trimmedArgs === "test" || trimmedArgs === "check") {
@@ -3273,6 +3325,7 @@ export class CodexAnywhereBridge {
       startLines.join("\n"),
     );
 
+    let pendingUpgradeSaved = false;
     try {
       const install = await this.#execFile(
         "npm",
@@ -3286,19 +3339,32 @@ export class CodexAnywhereBridge {
       );
       const installedCli = await this.#resolveInstalledCodexAnywhereCli();
       const summary = summarizeUpgradeOutput(install.stdout, install.stderr);
+      this.#state.pendingUpgradeNotification = {
+        chatId,
+        fromVersion: packageJson.version,
+        targetVersionLine: installedCli.versionLine,
+        startedAt: Date.now(),
+        failureNotifiedAt: null,
+      };
+      await this.#saveState();
+      pendingUpgradeSaved = true;
       await this.#sendHtmlText(
         chatId,
         [
           "<b>Upgrade installed</b>",
           `<code>${escapeTelegramHtml(summary)}</code>`,
           `Verified <code>${escapeTelegramHtml(installedCli.versionLine)}</code>.`,
-          "Scheduling a supervised service restart from the official package now. Send /version after a few seconds to confirm.",
+          "Scheduling a supervised service restart from the official package now.",
+          "The restarted service will send an automatic completion message when it is responsive.",
         ].join("\n"),
-      );
+      ).catch((error) => {
+        this.#logRuntimeError("upgrade installed notification", error);
+      });
       await this.#execFile("sh", ["-c", buildUpgradeServiceRestartCommand({
         nodePath: installedCli.nodePath,
         cliPath: installedCli.cliPath,
         storageRoot: path.dirname(this.#configPath),
+        pathEnv: process.env.PATH,
         platform: process.platform,
         uid: typeof process.getuid === "function" ? process.getuid() : undefined,
       })], {
@@ -3308,6 +3374,10 @@ export class CodexAnywhereBridge {
         maxBuffer: 1024 * 1024,
       });
     } catch (error) {
+      if (pendingUpgradeSaved) {
+        this.#state.pendingUpgradeNotification = null;
+        await this.#saveState();
+      }
       const message = error instanceof Error ? error.message : String(error);
       await this.#sendHtmlText(
         chatId,

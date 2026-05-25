@@ -149,6 +149,7 @@ function testState(): StoredState {
   return {
     version: 1,
     lastUpdateId: null,
+    pendingUpgradeNotification: null,
     chats: {},
   };
 }
@@ -1759,6 +1760,7 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.match(restartCommand, /codex-anywhere install-service attempt/);
   assert.match(restartCommand, /codex-anywhere install-service succeeded/);
   assert.match(restartCommand, /upgrade-restart\.log/);
+  assert.match(restartCommand, /export PATH=/);
   if (process.platform === "darwin") {
     assert.match(restartCommand, /launchctl bootstrap/);
     assert.match(restartCommand, /ai\.mempat\.codex-anywhere\.upgrade-restart/);
@@ -1780,6 +1782,76 @@ test("/upgrade installs latest package and schedules a supervised official servi
   assert.match(telegram.sentMessages[1]!.text, /Upgrade installed/);
   assert.match(telegram.sentMessages[1]!.text, /codex-anywhere 0\.3\.15/);
   assert.match(telegram.sentMessages[1]!.text, /supervised service restart/);
+  assert.match(telegram.sentMessages[1]!.text, /automatic completion message/);
+});
+
+test("startup sends pending upgrade completion from the restarted process", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-complete-"));
+  const state = testState();
+  state.pendingUpgradeNotification = {
+    chatId: 42,
+    fromVersion: "0.3.19",
+    targetVersionLine: "codex-anywhere 0.3.20",
+    startedAt: Date.now(),
+    failureNotifiedAt: null,
+  };
+  const telegram = new FakeTelegram();
+  const bridge = new CodexAnywhereBridge(
+    testConfig(),
+    path.join(tempDir, "config.json"),
+    path.join(tempDir, "state.json"),
+    {
+      telegram,
+      codex: new FakeCodex(),
+      initialState: state,
+    },
+  );
+
+  await bridge.initialize({ printStartupHelp: false });
+
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
+  assert.match(telegram.sentMessages[0]!.text, /Upgrade completed/);
+  assert.match(telegram.sentMessages[0]!.text, /The restarted service reached Telegram successfully/);
+  assert.equal(state.pendingUpgradeNotification, null);
+});
+
+test("startup reports pending upgrade failure when Codex initialization fails", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-upgrade-failed-"));
+  const state = testState();
+  state.pendingUpgradeNotification = {
+    chatId: 42,
+    fromVersion: "0.3.19",
+    targetVersionLine: "codex-anywhere 0.3.20",
+    startedAt: Date.now(),
+    failureNotifiedAt: null,
+  };
+  const telegram = new FakeTelegram();
+  const codex = new FakeCodex();
+  codex.start = async function (): Promise<void> {
+    throw new Error("codex was not found on PATH");
+  };
+  const bridge = new CodexAnywhereBridge(
+    testConfig(),
+    path.join(tempDir, "config.json"),
+    path.join(tempDir, "state.json"),
+    {
+      telegram,
+      codex,
+      initialState: state,
+    },
+  );
+
+  await assert.rejects(
+    bridge.initialize({ printStartupHelp: false }),
+    /codex was not found on PATH/,
+  );
+
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
+  assert.match(telegram.sentMessages[0]!.text, /Upgrade restart failed/);
+  assert.match(telegram.sentMessages[0]!.text, /codex was not found on PATH/);
+  assert.equal(typeof state.pendingUpgradeNotification?.failureNotifiedAt, "number");
 });
 
 test("/upgrade reports installed CLI verification failures", async () => {

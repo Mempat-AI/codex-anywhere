@@ -6,6 +6,7 @@ import type { StoredConfig, StoredState } from "./types.js";
 const DEFAULT_STATE: StoredState = {
   version: 1,
   lastUpdateId: null,
+  pendingUpgradeNotification: null,
   chats: {},
 };
 
@@ -19,6 +20,7 @@ export async function saveConfig(configPath: string, config: StoredConfig): Prom
 
 export async function loadState(statePath: string): Promise<StoredState> {
   const state = (await readJsonFile<StoredState>(statePath)) ?? structuredClone(DEFAULT_STATE);
+  state.pendingUpgradeNotification ??= null;
   for (const chat of Object.values(state.chats)) {
     chat.freshThread ??= false;
     chat.turnControlTurnId ??= null;

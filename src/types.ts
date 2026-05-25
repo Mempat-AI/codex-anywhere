@@ -69,9 +69,18 @@ export interface ChatSessionState {
   lastAssistantMessage: string | null;
 }
 
+export interface PendingUpgradeNotification {
+  chatId: number;
+  fromVersion: string;
+  targetVersionLine: string;
+  startedAt: number;
+  failureNotifiedAt: number | null;
+}
+
 export interface StoredState {
   version: 1;
   lastUpdateId: number | null;
+  pendingUpgradeNotification?: PendingUpgradeNotification | null;
   chats: Record<string, ChatSessionState>;
 }
 

@@ -19,6 +19,7 @@ export function buildUpgradeServiceRestartCommand(options: {
   nodePath: string;
   cliPath: string;
   storageRoot: string;
+  pathEnv?: string;
 } & UpgradeRestartRuntimeOptions): string {
   const logDir = path.join(options.storageRoot, "logs");
   const logPath = path.join(logDir, "upgrade-restart.log");
@@ -27,6 +28,7 @@ export function buildUpgradeServiceRestartCommand(options: {
     serviceCommand,
     storageRoot: options.storageRoot,
     logPath,
+    pathEnv: options.pathEnv,
   });
   return buildSupervisedUpgradeHelperCommand({
     script,
@@ -108,11 +110,13 @@ function buildUpgradeRestartScript(options: {
   serviceCommand: string;
   storageRoot: string;
   logPath: string;
+  pathEnv?: string;
 }): string {
   const { serviceCommand } = options;
   return [
     `exec >>${shellQuote(options.logPath)} 2>&1`,
     "sleep 3",
+    ...(options.pathEnv ? [`export PATH=${shellQuote(options.pathEnv)}`] : []),
     `export CODEX_ANYWHERE_HOME=${shellQuote(options.storageRoot)}`,
     `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') using ${serviceCommand}"`,
     `echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') installed version: $(${serviceCommand} --version 2>&1)"`,

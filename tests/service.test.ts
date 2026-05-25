@@ -340,7 +340,7 @@ test("restart-service on macOS reboots the existing LaunchAgent", async () => {
   await runBackgroundServiceCommand("restart-service", {
     cwd: repoDir,
     env: {
-      PATH: "/opt/homebrew/bin:/usr/bin:/bin",
+      PATH: "/usr/bin:/bin",
       HOME: homeDir,
       USER: "alice",
     },
@@ -376,6 +376,7 @@ test("restart-service on macOS reboots the existing LaunchAgent", async () => {
   ]);
   const refreshedPlist = await fs.readFile(spec.plistPath, "utf8");
   assert.equal(refreshedPlist.includes(path.join(repoDir, "dist", "cli.js")), true);
+  assert.match(refreshedPlist, /<key>PATH<\/key>\s*<string>[^<]*\/opt\/homebrew\/bin/);
   assert.doesNotMatch(refreshedPlist, /src\/cli\.ts/);
   assert.match(savedLogs.join("\n"), /Restarted LaunchAgent/);
 });

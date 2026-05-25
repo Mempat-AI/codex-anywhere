@@ -237,9 +237,11 @@ export async function runBackgroundServiceCommand(
   const packageRoot = options.packageRoot ?? resolvePackageRoot();
   const existingConfig =
     (await (options.loadConfig ?? loadConfig)(storagePaths.configPath)) ?? null;
+  const nodePath = options.nodePath ?? process.execPath;
+  const servicePathEnv = buildServicePathEnv(env.PATH, nodePath);
   const programArguments = await resolveServiceProgramArguments({
     packageRoot,
-    nodePath: options.nodePath ?? process.execPath,
+    nodePath,
     tsxCliPath: options.tsxCliPath,
   });
 
@@ -250,7 +252,7 @@ export async function runBackgroundServiceCommand(
       storageRoot,
       homeDir,
       uid,
-      pathEnv: env.PATH ?? "",
+      pathEnv: servicePathEnv,
       programArguments,
       extraEnv: {
         HOME: env.HOME ?? homeDir,
@@ -320,7 +322,7 @@ export async function runBackgroundServiceCommand(
       storageRoot,
       homeDir,
       configHome: env.XDG_CONFIG_HOME,
-      pathEnv: env.PATH ?? "",
+      pathEnv: servicePathEnv,
       programArguments,
       extraEnv: {
         HOME: env.HOME ?? homeDir,
@@ -670,6 +672,25 @@ function sanitizeEnvironmentVariables(
     }
   }
   return sanitized;
+}
+
+function buildServicePathEnv(pathEnv: string | undefined, nodePath: string): string {
+  const fallbackEntries = [
+    path.dirname(nodePath),
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  const entries = [
+    ...(pathEnv ?? "").split(":"),
+    ...fallbackEntries,
+  ].filter(Boolean);
+  return Array.from(new Set(entries)).join(":");
 }
 
 function buildServiceId(storageRoot: string): string {
