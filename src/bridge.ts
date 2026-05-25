@@ -3963,16 +3963,22 @@ export class CodexAnywhereBridge {
     }
 
     if (card.finalized && !card.finalSent) {
-      for (const chunk of buildTurnFinalHtmlChunks(card)) {
-        await this.#telegram.sendMessage(
-          card.chatId,
-          chunk,
-          undefined,
-          "HTML",
-          card.originMessageId,
-        );
-      }
+      const chunks = buildTurnFinalHtmlChunks(card);
       card.finalSent = true;
+      try {
+        for (const chunk of chunks) {
+          await this.#telegram.sendMessage(
+            card.chatId,
+            chunk,
+            undefined,
+            "HTML",
+            card.originMessageId,
+          );
+        }
+      } catch (error) {
+        card.finalSent = false;
+        throw error;
+      }
     }
 
     card.lastEditAt = now;

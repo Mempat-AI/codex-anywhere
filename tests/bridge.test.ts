@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { setTimeout as sleep } from "node:timers/promises";
 
 import { CodexAnywhereBridge } from "../src/bridge.js";
 import { loadConfig, loadState, saveConfig, saveState } from "../src/persistence.js";
@@ -88,6 +89,32 @@ class FakeTelegram {
   }
 
   async deleteMessage(): Promise<void> {}
+}
+
+class DelayedEditTelegram extends FakeTelegram {
+  delayEdits = false;
+  readonly editWaiters: Array<() => void> = [];
+
+  override async editMessageText(
+    chatId: number,
+    messageId: number,
+    text: string,
+    replyMarkup?: JsonObject,
+    parseMode?: string,
+  ): Promise<void> {
+    if (this.delayEdits) {
+      await new Promise<void>((resolve) => {
+        this.editWaiters.push(resolve);
+      });
+    }
+    await super.editMessageText(chatId, messageId, text, replyMarkup, parseMode);
+  }
+
+  releaseEdits(): void {
+    for (const resolve of this.editWaiters.splice(0)) {
+      resolve();
+    }
+  }
 }
 
 class FakeCodex {
@@ -241,6 +268,16 @@ function telegramCallbackUpdate(data: string): TelegramUpdate {
 const serialTest = { concurrency: false } as const;
 const runOmxCommandTest = process.env.SKIP_OMX_COMMAND_TESTS === "1" ? test.skip : test;
 
+async function waitForCondition(condition: () => boolean): Promise<void> {
+  for (let i = 0; i < 50; i += 1) {
+    if (condition()) {
+      return;
+    }
+    await sleep(10);
+  }
+  assert.fail("condition was not met in time");
+}
+
 runOmxCommandTest("bridge routes /omx version through Telegram message output", serialTest, async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
@@ -375,6 +412,55 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.equal(telegram.editedMessages[1]!.messageId, 1);
   assert.match(telegram.editedMessages[1]!.text, /Run details/);
   assert.doesNotMatch(telegram.editedMessages[1]!.text, /^a+$/);
+});
+
+test("overlapping final card flushes reserve the final response before sending", async () => {
+  const telegram = new DelayedEditTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("hello"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    turn: {
+      id: "turn-1",
+    },
+  });
+
+  telegram.delayEdits = true;
+  const finalItem = bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Race final.",
+      phase: "final",
+    },
+  });
+  await waitForCondition(() => telegram.editWaiters.length >= 1);
+
+  const completedTurn = bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+    },
+  });
+  await waitForCondition(() => telegram.editWaiters.length >= 2);
+
+  telegram.delayEdits = false;
+  telegram.releaseEdits();
+  await Promise.all([finalItem, completedTurn]);
+
+  const finalMessages = telegram.sentMessages.filter((message) => message.text === "Race final.");
+  assert.equal(finalMessages.length, 1);
+  assert.equal(finalMessages[0]!.replyToMessageId, 1);
 });
 
 test("turn card keeps run details above a fresh final answer message", async () => {
