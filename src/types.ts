@@ -9,6 +9,21 @@ export interface TelegramBotCommand {
   description: string;
 }
 
+interface TelegramInputRichMessageOptions {
+  is_rtl?: boolean;
+  skip_entity_detection?: boolean;
+}
+
+export type TelegramInputRichMessage = TelegramInputRichMessageOptions & (
+  | { html: string; markdown?: never }
+  | { markdown: string; html?: never }
+);
+
+export interface TelegramRichMessage {
+  blocks: JsonObject[];
+  is_rtl?: boolean;
+}
+
 export interface StoredSingleBotConfig {
   version: 1;
   telegramBotToken: string;
@@ -104,6 +119,7 @@ export interface TelegramMessage {
   chat: { id: number; type: string };
   from?: { id: number };
   text?: string;
+  rich_message?: TelegramRichMessage;
   caption?: string;
   photo?: TelegramPhotoSize[];
   document?: TelegramDocument;
@@ -163,6 +179,7 @@ export interface StreamBuffer {
   threadId: string;
   turnId: string;
   streamId: string;
+  itemId: string;
   chatId: number;
   text: string;
   messageId: number | null;

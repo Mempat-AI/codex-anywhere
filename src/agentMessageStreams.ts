@@ -2,9 +2,6 @@ export function agentStreamKey(threadId: string, turnId: string, streamGroupId: 
   return `${threadId}:${turnId}:${streamGroupId}`;
 }
 
-export function streamGroupId(itemId: string, phase: string | null): string {
-  if (phase === "commentary") {
-    return "__commentary__";
-  }
+export function streamGroupId(itemId: string, _phase: string | null): string {
   return itemId;
 }

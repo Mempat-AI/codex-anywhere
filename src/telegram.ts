@@ -3,7 +3,12 @@ import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 import type { TelegramParseMode } from "./telegramFormatting.js";
-import type { JsonObject, TelegramBotCommand, TelegramUpdate } from "./types.js";
+import type {
+  JsonObject,
+  TelegramBotCommand,
+  TelegramInputRichMessage,
+  TelegramUpdate,
+} from "./types.js";
 
 const TELEGRAM_RATE_LIMIT_RETRIES = 1;
 
@@ -94,14 +99,77 @@ export class TelegramBotApi {
     return (await this.#request("sendMessage", payload)) as { message_id: number };
   }
 
-  async sendDocument(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
-    return (await this.#uploadFile("sendDocument", chatId, "document", filePath, caption)) as {
+  async sendRichMessage(
+    chatId: number,
+    richMessage: TelegramInputRichMessage,
+    replyMarkup?: JsonObject,
+    replyToMessageId?: number | null,
+  ): Promise<{ message_id: number }> {
+    const payload: JsonObject = {
+      chat_id: chatId,
+      rich_message: richMessage,
+    };
+    if (replyMarkup) {
+      payload.reply_markup = replyMarkup;
+    }
+    if (replyToMessageId !== null && replyToMessageId !== undefined) {
+      payload.reply_parameters = {
+        message_id: replyToMessageId,
+      };
+    }
+    return (await this.#request("sendRichMessage", payload)) as { message_id: number };
+  }
+
+  async sendRichMessageDraft(
+    chatId: number,
+    draftId: number,
+    richMessage: TelegramInputRichMessage,
+    messageThreadId?: number,
+    options?: TelegramRequestOptions,
+  ): Promise<boolean> {
+    const payload: JsonObject = {
+      chat_id: chatId,
+      draft_id: draftId,
+      rich_message: richMessage,
+    };
+    if (messageThreadId !== undefined) {
+      payload.message_thread_id = messageThreadId;
+    }
+    return (await this.#request("sendRichMessageDraft", payload, options)) as boolean;
+  }
+
+  async sendDocument(
+    chatId: number,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: number | null,
+  ): Promise<{ message_id: number }> {
+    return (await this.#uploadFile(
+      "sendDocument",
+      chatId,
+      "document",
+      filePath,
+      caption,
+      replyToMessageId,
+    )) as {
       message_id: number;
     };
   }
 
-  async sendPhoto(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
-    return (await this.#uploadFile("sendPhoto", chatId, "photo", filePath, caption)) as {
+  async sendPhoto(
+    chatId: number,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: number | null,
+  ): Promise<{ message_id: number }> {
+    return (await this.#uploadFile(
+      "sendPhoto",
+      chatId,
+      "photo",
+      filePath,
+      caption,
+      replyToMessageId,
+    )) as {
       message_id: number;
     };
   }
@@ -124,6 +192,31 @@ export class TelegramBotApi {
     }
     if (parseMode) {
       payload.parse_mode = parseMode;
+    }
+    try {
+      await this.#request("editMessageText", payload, options);
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("message is not modified")) {
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async editRichMessage(
+    chatId: number,
+    messageId: number,
+    richMessage: TelegramInputRichMessage,
+    replyMarkup?: JsonObject,
+    options?: TelegramRequestOptions,
+  ): Promise<void> {
+    const payload: JsonObject = {
+      chat_id: chatId,
+      message_id: messageId,
+      rich_message: richMessage,
+    };
+    if (replyMarkup) {
+      payload.reply_markup = replyMarkup;
     }
     try {
       await this.#request("editMessageText", payload, options);
@@ -169,6 +262,7 @@ export class TelegramBotApi {
     fieldName: "document" | "photo",
     filePath: string,
     caption?: string,
+    replyToMessageId?: number | null,
   ): Promise<unknown> {
     const bytes = await fs.readFile(filePath);
     return this.#withRetry(method, async () => {
@@ -176,6 +270,9 @@ export class TelegramBotApi {
       form.append("chat_id", String(chatId));
       if (caption) {
         form.append("caption", caption);
+      }
+      if (replyToMessageId !== null && replyToMessageId !== undefined) {
+        form.append("reply_parameters", JSON.stringify({ message_id: replyToMessageId }));
       }
       form.append(fieldName, new Blob([bytes]), path.basename(filePath));
 

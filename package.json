@@ -48,7 +48,7 @@
     "service:stop:dist": "node dist/cli.js stop-service",
     "service:status:dist": "node dist/cli.js service-status",
     "service:uninstall:dist": "node dist/cli.js uninstall-service",
-    "build": "rm -rf dist && tsc -p tsconfig.json",
+    "build": "rm -rf dist && tsc -p tsconfig.json && chmod +x dist/cli.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "pnpm run typecheck",
     "test": "node --test --test-concurrency=1 --import tsx tests/*.test.ts",

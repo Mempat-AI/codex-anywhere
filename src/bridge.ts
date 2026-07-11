@@ -59,7 +59,11 @@ import {
   parseTelegramSlashCommand,
 } from "./slashCommands.js";
 import { buildOmxHelpText, planOmxCommand } from "./omxCommands.js";
-import { TelegramBotApi } from "./telegram.js";
+import {
+  buildAssistantRichFinalParts,
+  buildAssistantRichProgress,
+} from "./richMessageFormatting.js";
+import { TelegramApiError, TelegramBotApi } from "./telegram.js";
 import {
   escapeTelegramHtml,
   formatApprovalPromptHtml,
@@ -130,7 +134,10 @@ type TelegramClient = Pick<
   | "editMessageText"
   | "answerCallbackQuery"
   | "deleteMessage"
->;
+> & {
+  sendRichMessage?: TelegramBotApi["sendRichMessage"];
+  editRichMessage?: TelegramBotApi["editRichMessage"];
+};
 
 type CodexClient = Pick<
   CodexAppServerClient,
@@ -142,6 +149,7 @@ interface PendingTurnOrigin {
 }
 
 interface TurnTraceEntry {
+  itemId: string | null;
   label: string;
   text: string;
 }
@@ -155,6 +163,10 @@ interface TurnCard {
   currentStatus: string;
   finalText: string | null;
   trace: TurnTraceEntry[];
+  sentGeneratedImageItemIds: Set<string>;
+  richProgressMessageId: number | null;
+  richProgressDisabled: boolean;
+  richProgressFailureCount: number;
   lastEditAt: number;
   flushInFlight: Promise<void> | null;
   finalized: boolean;
@@ -289,6 +301,10 @@ export class CodexAnywhereBridge {
 
   async handleNotificationForTest(method: string, params: JsonObject): Promise<void> {
     await this.#handleNotification(method, params);
+  }
+
+  typingIndicatorActiveForTest(chatId: number): boolean {
+    return this.#typingIntervals.has(chatId);
   }
 
   async #pollTelegramLoop(): Promise<void> {
@@ -2880,24 +2896,30 @@ export class CodexAnywhereBridge {
       const chatId = threadId ? this.#findChatIdByThread(threadId) : null;
       if (threadId && turnId && chatId !== null && item) {
         const itemType = asString(item.type);
-        if (itemType === "commandExecution") {
-          const command = asString(item.command) ?? "command";
-          await this.#updateTurnCardStatus(
+        const toolTrace = summarizeToolTraceItem(
+          item,
+          this.#chatState(chatId).verbose,
+          "started",
+        );
+        if (toolTrace) {
+          await this.#appendTurnTrace(
             threadId,
             turnId,
             chatId,
-            `Running command: ${truncatePlain(command, 120)}`,
+            toolTrace.label,
+            toolTrace.text,
+            asString(item.id),
           );
-        } else if (itemType === "fileChange") {
-          await this.#updateTurnCardStatus(threadId, turnId, chatId, "Applying file changes");
         } else if (itemType === "agentMessage") {
           const phase = asString(item.phase);
-          await this.#updateTurnCardStatus(
-            threadId,
-            turnId,
-            chatId,
-            phase === "commentary" ? "Thinking" : "Writing final answer",
-          );
+          if (phase !== "commentary") {
+            await this.#updateTurnCardStatus(
+              threadId,
+              turnId,
+              chatId,
+              "Writing final answer",
+            );
+          }
         }
       }
       return;
@@ -2912,7 +2934,7 @@ export class CodexAnywhereBridge {
         this.#chatState(chatId).freshThread = false;
         await this.#saveState();
         this.#startTypingIndicator(chatId);
-        await this.#updateTurnCardStatus(threadId, turnId, chatId, "Thinking");
+        await this.#updateTurnCardStatus(threadId, turnId, chatId, "Analyzing request");
       }
       return;
     }
@@ -2966,24 +2988,24 @@ export class CodexAnywhereBridge {
         }
         return;
       }
-      if (itemType === "commandExecution") {
+      const toolTrace = summarizeToolTraceItem(
+        item,
+        this.#chatState(chatId).verbose,
+        "completed",
+      );
+      if (toolTrace) {
         await this.#appendTurnTrace(
           threadId,
           turnId,
           chatId,
-          "Tool",
-          summarizeCommandTrace(item, this.#chatState(chatId).verbose),
+          toolTrace.label,
+          toolTrace.text,
+          asString(item.id),
         );
+        if (itemType === "imageGeneration") {
+          await this.#sendGeneratedImage(threadId, turnId, chatId, item);
+        }
         return;
-      }
-      if (itemType === "fileChange") {
-        await this.#appendTurnTrace(
-          threadId,
-          turnId,
-          chatId,
-          "Files",
-          summarizeFileChangeTrace(item),
-        );
       }
       return;
     }
@@ -3733,7 +3755,7 @@ export class CodexAnywhereBridge {
     if (stream.phase === "commentary") {
       this.#setTurnCardStatus(card, latestStatusLine(raw) ?? "Thinking");
       if (force && raw.trim()) {
-        this.#addTurnTrace(card, "Preamble", raw.trim());
+        this.#addTurnTrace(card, "Preamble", raw.trim(), stream.itemId);
       }
       await this.#flushTurnCard(card, { force });
     } else {
@@ -3799,16 +3821,19 @@ export class CodexAnywhereBridge {
       chatId,
       detailsMessageId: null,
       originMessageId: origin?.originMessageId ?? null,
-      currentStatus: "Thinking",
+      currentStatus: "Analyzing request",
       finalText: null,
       trace: [],
+      sentGeneratedImageItemIds: new Set<string>(),
+      richProgressMessageId: null,
+      richProgressDisabled: false,
+      richProgressFailureCount: 0,
       lastEditAt: 0,
       flushInFlight: null,
       finalized: false,
       finalSent: false,
     };
     this.#turnCards.set(key, card);
-    await this.#flushTurnCard(card, { force: true });
     return card;
   }
 
@@ -3829,11 +3854,54 @@ export class CodexAnywhereBridge {
     chatId: number,
     label: string,
     text: string,
+    itemId: string | null = null,
   ): Promise<void> {
     const card = await this.#ensureTurnCard(threadId, turnId, chatId);
-    this.#addTurnTrace(card, label, text);
+    this.#addTurnTrace(card, label, text, itemId);
     this.#setTurnCardStatus(card, compactTraceLine(text));
     await this.#flushTurnCard(card, { force: true });
+  }
+
+  async #sendGeneratedImage(
+    threadId: string,
+    turnId: string,
+    chatId: number,
+    item: JsonObject,
+  ): Promise<void> {
+    const itemId = asString(item.id);
+    const savedPath = asString(item.savedPath);
+    if (!itemId || !savedPath) {
+      return;
+    }
+
+    const card = await this.#ensureTurnCard(threadId, turnId, chatId);
+    if (card.sentGeneratedImageItemIds.has(itemId)) {
+      return;
+    }
+    card.sentGeneratedImageItemIds.add(itemId);
+
+    const imagePath = await resolveGeneratedImagePreviewPath(
+      this.#config.workspaceCwd,
+      savedPath,
+    );
+    if (!imagePath) {
+      this.#logRuntimeError(
+        "generated image preview",
+        new Error(`Generated image path is unavailable or outside trusted roots: ${savedPath}`),
+      );
+      return;
+    }
+
+    try {
+      await this.#telegram.sendPhoto(
+        chatId,
+        imagePath,
+        "Generated image",
+        card.originMessageId,
+      );
+    } catch (error) {
+      this.#logRuntimeError("send generated image preview", error);
+    }
   }
 
   #setTurnCardStatus(card: TurnCard, status: string): void {
@@ -3842,19 +3910,29 @@ export class CodexAnywhereBridge {
     }
   }
 
-  #addTurnTrace(card: TurnCard, label: string, text: string): void {
+  #addTurnTrace(
+    card: TurnCard,
+    label: string,
+    text: string,
+    itemId: string | null = null,
+  ): void {
     const normalized = text.trim();
     if (!normalized) {
       return;
+    }
+    if (itemId) {
+      const existing = card.trace.find((entry) => entry.itemId === itemId);
+      if (existing) {
+        existing.label = label;
+        existing.text = normalized;
+        return;
+      }
     }
     const previous = card.trace.at(-1);
     if (previous?.label === label && previous.text === normalized) {
       return;
     }
-    card.trace.push({ label, text: normalized });
-    if (card.trace.length > 40) {
-      card.trace.splice(0, card.trace.length - 40);
-    }
+    card.trace.push({ itemId, label, text: normalized });
   }
 
   async #finalizeTurnCard(
@@ -3926,6 +4004,148 @@ export class CodexAnywhereBridge {
       return;
     }
 
+    if (!card.finalized) {
+      const richProgressVisible = await this.#tryUpdateRichProgress(card);
+      if (!richProgressVisible) {
+        await this.#flushLegacyTurnCard(card);
+      }
+      card.lastEditAt = now;
+      return;
+    }
+
+    if (!card.finalSent) {
+      const finalText = card.finalText?.trim() || "Done.";
+      card.finalSent = true;
+      try {
+        const richFinalSent = await this.#trySendFinalRichMessages(card, finalText);
+        if (!richFinalSent) {
+          await this.#removeRichProgressMessage(card);
+          await this.#flushLegacyTurnCard(card);
+          await this.#sendFinalHtmlChunks(card, finalText);
+        }
+      } catch (error) {
+        card.finalSent = false;
+        throw error;
+      }
+    }
+
+    card.lastEditAt = now;
+  }
+
+  async #tryUpdateRichProgress(card: TurnCard): Promise<boolean> {
+    if (
+      !this.#telegram.sendRichMessage
+      || !this.#telegram.editRichMessage
+      || card.richProgressDisabled
+    ) {
+      return card.richProgressMessageId !== null;
+    }
+
+    const richMessage = buildAssistantRichProgress({
+      text: card.finalText,
+      status: card.currentStatus,
+      trace: card.trace,
+    });
+    try {
+      if (card.richProgressMessageId === null) {
+        const sent = await this.#telegram.sendRichMessage(
+          card.chatId,
+          richMessage,
+          undefined,
+          card.originMessageId,
+        );
+        card.richProgressMessageId = sent.message_id;
+      } else {
+        await this.#telegram.editRichMessage(
+          card.chatId,
+          card.richProgressMessageId,
+          richMessage,
+          undefined,
+          { retry: false },
+        );
+      }
+      card.richProgressFailureCount = 0;
+      return true;
+    } catch (error) {
+      card.richProgressFailureCount += 1;
+      if (isPermanentRichMessageError(error) || card.richProgressFailureCount >= 3) {
+        card.richProgressDisabled = true;
+      }
+      this.#logRuntimeError("update rich progress", error);
+      return card.richProgressMessageId !== null;
+    }
+  }
+
+  async #trySendFinalRichMessages(card: TurnCard, finalText: string): Promise<boolean> {
+    if (!this.#telegram.sendRichMessage) {
+      return false;
+    }
+
+    const parts = buildAssistantRichFinalParts({
+      text: finalText,
+      trace: card.trace,
+    });
+    let sentAny = false;
+    let allRich = true;
+    let traceFallbackSent = false;
+    for (const [index, part] of parts.entries()) {
+      if (
+        index === 0
+        && card.richProgressMessageId !== null
+        && this.#telegram.editRichMessage
+      ) {
+        try {
+          await this.#telegram.editRichMessage(
+            card.chatId,
+            card.richProgressMessageId,
+            part.richMessage,
+          );
+          card.richProgressMessageId = null;
+          sentAny = true;
+          continue;
+        } catch (error) {
+          this.#logRuntimeError("finalize rich progress", error);
+        }
+      }
+      try {
+        await this.#telegram.sendRichMessage(
+          card.chatId,
+          part.richMessage,
+          undefined,
+          index === 0 ? card.originMessageId : undefined,
+        );
+        sentAny = true;
+      } catch (error) {
+        this.#logRuntimeError("sendRichMessage", error);
+        allRich = false;
+        if (!sentAny) {
+          return false;
+        }
+        if (part.fallbackMarkdown) {
+          await this.#sendFinalHtmlChunks(card, part.fallbackMarkdown);
+        } else {
+          await this.#sendHtmlText(card.chatId, renderTurnTraceHtml(card.trace));
+          traceFallbackSent = true;
+        }
+      }
+    }
+
+    if (sentAny) {
+      await this.#removeRichProgressMessage(card);
+      if (allRich) {
+        await this.#removeLegacyTurnCard(card);
+      } else if (
+        card.trace.length > 0
+        && card.detailsMessageId === null
+        && !traceFallbackSent
+      ) {
+        await this.#sendHtmlText(card.chatId, renderTurnTraceHtml(card.trace));
+      }
+    }
+    return sentAny;
+  }
+
+  async #flushLegacyTurnCard(card: TurnCard): Promise<void> {
     const detailsHtml = renderTurnDetailsCardHtml(card);
     if (card.detailsMessageId === null) {
       const message = await this.#telegram.sendMessage(
@@ -3936,36 +4156,53 @@ export class CodexAnywhereBridge {
         card.originMessageId,
       );
       card.detailsMessageId = message.message_id;
-    } else {
-      await this.#telegram.editMessageText(
+      return;
+    }
+    await this.#telegram.editMessageText(
+      card.chatId,
+      card.detailsMessageId,
+      detailsHtml,
+      undefined,
+      "HTML",
+    );
+  }
+
+  async #removeLegacyTurnCard(card: TurnCard): Promise<void> {
+    if (card.detailsMessageId === null) {
+      return;
+    }
+    const messageId = card.detailsMessageId;
+    card.detailsMessageId = null;
+    try {
+      await this.#telegram.deleteMessage(card.chatId, messageId);
+    } catch (error) {
+      this.#logRuntimeError("delete legacy turn card", error);
+    }
+  }
+
+  async #removeRichProgressMessage(card: TurnCard): Promise<void> {
+    if (card.richProgressMessageId === null) {
+      return;
+    }
+    const messageId = card.richProgressMessageId;
+    card.richProgressMessageId = null;
+    try {
+      await this.#telegram.deleteMessage(card.chatId, messageId);
+    } catch (error) {
+      this.#logRuntimeError("delete rich progress", error);
+    }
+  }
+
+  async #sendFinalHtmlChunks(card: TurnCard, finalText: string): Promise<void> {
+    for (const chunk of buildTurnFinalHtmlChunks(finalText)) {
+      await this.#telegram.sendMessage(
         card.chatId,
-        card.detailsMessageId,
-        detailsHtml,
+        chunk,
         undefined,
         "HTML",
+        card.originMessageId,
       );
     }
-
-    if (card.finalized && !card.finalSent) {
-      const chunks = buildTurnFinalHtmlChunks(card);
-      card.finalSent = true;
-      try {
-        for (const chunk of chunks) {
-          await this.#telegram.sendMessage(
-            card.chatId,
-            chunk,
-            undefined,
-            "HTML",
-            card.originMessageId,
-          );
-        }
-      } catch (error) {
-        card.finalSent = false;
-        throw error;
-      }
-    }
-
-    card.lastEditAt = now;
   }
 
   async #clearTurnControls(chatId: number, turnId: string): Promise<void> {
@@ -4023,6 +4260,7 @@ export class CodexAnywhereBridge {
       threadId,
       turnId,
       streamId,
+      itemId,
       chatId,
       text: "",
       messageId: null,
@@ -4701,8 +4939,7 @@ function renderTurnStatusHtml(card: TurnCard): string {
   return escapeTelegramHtml(truncatePlain(card.currentStatus, 1400));
 }
 
-function buildTurnFinalHtmlChunks(card: TurnCard): string[] {
-  const finalText = card.finalText?.trim() || "Done.";
+function buildTurnFinalHtmlChunks(finalText: string): string[] {
   return splitTelegramChunks(finalText, 3900).map(renderAssistantTextHtml);
 }
 
@@ -4718,6 +4955,144 @@ function latestStatusLine(text: string): string | null {
 function compactTraceLine(text: string): string {
   const line = latestStatusLine(text) ?? text.trim();
   return truncatePlain(line, 160);
+}
+
+function isPermanentRichMessageError(error: unknown): boolean {
+  if (error instanceof TelegramApiError && error.retryAfterSeconds !== null) {
+    return false;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return /method not found|private chat|not supported|unsupported/i.test(message);
+}
+
+function summarizeToolTraceItem(
+  item: JsonObject,
+  verbose: boolean,
+  phase: "started" | "completed",
+): { label: string; text: string } | null {
+  const itemType = asString(item.type);
+  if (itemType === "commandExecution") {
+    const command = asString(item.command) ?? "command";
+    return {
+      label: "Tool",
+      text: phase === "started"
+        ? `Running command: ${truncatePlain(command, 500)}`
+        : summarizeCommandTrace(item, verbose),
+    };
+  }
+  if (itemType === "fileChange") {
+    return {
+      label: "Files",
+      text: phase === "started" ? "Applying file changes" : summarizeFileChangeTrace(item),
+    };
+  }
+  if (itemType === "mcpToolCall") {
+    const name = [asString(item.server), asString(item.tool)].filter(Boolean).join(".") || "MCP tool";
+    return {
+      label: "MCP",
+      text: joinTraceLines(
+        phase === "started"
+          ? `Calling ${name}`
+          : `${name} ${formatToolTraceStatus(asString(item.status))}`,
+        verbose ? formatTraceValue("Arguments", item.arguments) : null,
+        verbose ? formatTraceValue("Result", item.result ?? item.error) : null,
+      ),
+    };
+  }
+  if (itemType === "dynamicToolCall") {
+    const tool = asString(item.tool) ?? "dynamic tool";
+    const namespace = asString(item.namespace);
+    const name = namespace ? `${namespace}.${tool}` : tool;
+    return {
+      label: "Tool",
+      text: joinTraceLines(
+        phase === "started"
+          ? `Calling ${name}`
+          : `${name} ${formatToolTraceStatus(asString(item.status))}`,
+        verbose ? formatTraceValue("Arguments", item.arguments) : null,
+        verbose ? formatTraceValue("Result", item.contentItems) : null,
+      ),
+    };
+  }
+  if (itemType === "collabAgentToolCall") {
+    const tool = asString(item.tool) ?? "agent tool";
+    const receivers = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.length : 0;
+    const receiverSummary = receivers > 0 ? ` (${receivers} agent${receivers === 1 ? "" : "s"})` : "";
+    return {
+      label: "Agent",
+      text: joinTraceLines(
+        phase === "started"
+          ? `Running ${tool}${receiverSummary}`
+          : `${tool} ${formatToolTraceStatus(asString(item.status))}${receiverSummary}`,
+        verbose && asString(item.prompt) ? `Prompt: ${truncatePlain(asString(item.prompt)!, 500)}` : null,
+      ),
+    };
+  }
+  if (itemType === "webSearch") {
+    const query = asString(item.query) ?? "web search";
+    return {
+      label: "Search",
+      text: `${phase === "started" ? "Searching" : "Searched"}: ${truncatePlain(query, 500)}`,
+    };
+  }
+  if (itemType === "imageGeneration") {
+    const savedPath = asString(item.savedPath);
+    return {
+      label: "Image",
+      text: phase === "started"
+        ? "Generating image"
+        : joinTraceLines(
+          `Image generation ${formatToolTraceStatus(asString(item.status))}`,
+          savedPath ? `Saved: ${savedPath}` : null,
+        ),
+    };
+  }
+  if (itemType === "imageView") {
+    return {
+      label: "Image",
+      text: `Viewing image: ${asString(item.path) ?? "image"}`,
+    };
+  }
+  if (itemType === "subAgentActivity") {
+    const kind = formatToolTraceStatus(asString(item.kind));
+    const path = asString(item.agentPath);
+    return {
+      label: "Agent",
+      text: `Subagent ${kind}${path ? `: ${path}` : ""}`,
+    };
+  }
+  if (itemType === "sleep") {
+    const durationMs = typeof item.durationMs === "number" ? item.durationMs : null;
+    return {
+      label: "Wait",
+      text: durationMs === null ? "Waiting" : `Waiting ${durationMs} ms`,
+    };
+  }
+  return null;
+}
+
+function joinTraceLines(...lines: Array<string | null>): string {
+  return lines.filter((line): line is string => Boolean(line)).join("\n");
+}
+
+function formatTraceValue(label: string, value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  let rendered: string;
+  try {
+    rendered = typeof value === "string" ? value : JSON.stringify(value);
+  } catch {
+    rendered = String(value);
+  }
+  return `${label}: ${truncatePlain(rendered.replace(/\s+/g, " "), 800)}`;
+}
+
+function formatToolTraceStatus(status: string | null): string {
+  if (!status) {
+    return "completed";
+  }
+  return status.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
 }
 
 function summarizeCommandTrace(item: JsonObject, verbose: boolean): string {
@@ -5245,6 +5620,45 @@ function resolveWorkspaceDownloadPath(workspaceCwd: string, requestedPath: strin
     path.resolve(os.tmpdir()),
   ];
   return allowedRoots.some((root) => isPathInsideOrEqual(resolvedPath, root)) ? resolvedPath : null;
+}
+
+async function resolveGeneratedImagePreviewPath(
+  workspaceCwd: string,
+  savedPath: string,
+): Promise<string | null> {
+  let realPath: string;
+  try {
+    realPath = await fs.realpath(path.resolve(savedPath));
+  } catch {
+    return null;
+  }
+
+  const trustedRoots = await Promise.all([
+    workspaceCwd,
+    os.tmpdir(),
+    path.join(os.homedir(), ".codex", "generated_images"),
+  ].map(async (root) => {
+    try {
+      return await fs.realpath(path.resolve(root));
+    } catch {
+      return path.resolve(root);
+    }
+  }));
+  if (!trustedRoots.some((root) => isPathInsideOrEqual(realPath, root))) {
+    return null;
+  }
+  if (!isLikelyImagePath(realPath)) {
+    return null;
+  }
+
+  try {
+    const stat = await fs.stat(realPath);
+    return stat.isFile() && stat.size <= TELEGRAM_PHOTO_UPLOAD_LIMIT_BYTES
+      ? realPath
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function isPathInsideOrEqual(targetPath: string, rootPath: string): boolean {

@@ -209,6 +209,37 @@ test("renderAssistantTextHtml renders web markdown links", () => {
   assert.equal(html, 'Open <a href="https://example.com?a=1&amp;b=2">docs</a>.');
 });
 
+test("renderAssistantTextHtml renders markdown tables as preformatted text", () => {
+  const html = renderAssistantTextHtml([
+    "三层必须分开:",
+    "",
+    "| 层 | OAuth Scout | Customized Scout |",
+    "|---|---|---|",
+    "| Runtime 身份 | scout_id=ws_a | scout_id=ws_b |",
+    "| Hub 寻址方式 | Slack <@U123> | 明文 @Skyward |",
+  ].join("\n"));
+
+  assert.match(html, /三层必须分开:/);
+  assert.match(html, /<pre>层\s+\| OAuth Scout\s+\| Customized Scout/);
+  assert.match(html, /Runtime 身份\s+\| scout_id=ws_a\s+\| scout_id=ws_b/);
+  assert.match(html, /Slack &lt;@U123&gt;/);
+});
+
+test("renderAssistantTextHtml strips inline markdown inside table cells", () => {
+  const html = renderAssistantTextHtml([
+    "| Item | Value |",
+    "| --- | --- |",
+    "| **Bold** | `code <x>` |",
+    "| [Link](https://example.com) | plain |",
+  ].join("\n"));
+
+  assert.match(html, /<pre>Item/);
+  assert.match(html, /Bold\s+\| code &lt;x&gt;/);
+  assert.match(html, /Link\s+\| plain/);
+  assert.doesNotMatch(html, /<b>/);
+  assert.doesNotMatch(html, /<code>/);
+});
+
 test("renderAssistantTextHtml compacts local markdown file links", () => {
   const html = renderAssistantTextHtml(
     "- [workstreams/[sessionId]/page.tsx](/Users/twocode/project/app/(studio)/workstreams/[sessionId]/page.tsx:166): Runtime history",

@@ -34,6 +34,98 @@ test("sendMessage can reply to the source Telegram message", async () => {
   }
 });
 
+test("sendRichMessage sends InputRichMessage HTML", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedPayload: Record<string, unknown> | null = null;
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    requestedPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({ ok: true, result: { message_id: 11 } });
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    const result = await api.sendRichMessage(
+      42,
+      { html: "<table><tr><td>x</td></tr></table>" },
+      undefined,
+      123,
+    );
+
+    assert.equal(result.message_id, 11);
+    assert.equal(requestedUrl, "https://api.telegram.org/bottoken/sendRichMessage");
+    assert.deepEqual(requestedPayload, {
+      chat_id: 42,
+      rich_message: {
+        html: "<table><tr><td>x</td></tr></table>",
+      },
+      reply_parameters: {
+        message_id: 123,
+      },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("sendRichMessageDraft streams InputRichMessage Markdown", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedPayload: Record<string, unknown> | null = null;
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    requestedPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({ ok: true, result: true });
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    const result = await api.sendRichMessageDraft(
+      42,
+      991,
+      { markdown: "Working\n\n<tg-thinking>Thinking</tg-thinking>" },
+      7,
+      { retry: false },
+    );
+
+    assert.equal(result, true);
+    assert.equal(requestedUrl, "https://api.telegram.org/bottoken/sendRichMessageDraft");
+    assert.deepEqual(requestedPayload, {
+      chat_id: 42,
+      draft_id: 991,
+      rich_message: {
+        markdown: "Working\n\n<tg-thinking>Thinking</tg-thinking>",
+      },
+      message_thread_id: 7,
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("editRichMessage edits a message using structured content", async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = "";
+  let requestedPayload: Record<string, unknown> | null = null;
+  globalThis.fetch = async (input, init) => {
+    requestedUrl = String(input);
+    requestedPayload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return Response.json({ ok: true, result: { message_id: 11 } });
+  };
+  try {
+    const api = new TelegramBotApi("token");
+    await api.editRichMessage(42, 11, { markdown: "# Updated" });
+
+    assert.equal(requestedUrl, "https://api.telegram.org/bottoken/editMessageText");
+    assert.deepEqual(requestedPayload, {
+      chat_id: 42,
+      message_id: 11,
+      rich_message: { markdown: "# Updated" },
+    });
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("sendMessage retries once after Telegram retry_after", async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;
@@ -167,13 +259,14 @@ test("sendPhoto uploads a local image with Telegram multipart form-data", async 
   };
   try {
     const api = new TelegramBotApi("token");
-    const result = await api.sendPhoto(42, filePath, "image");
+    const result = await api.sendPhoto(42, filePath, "image", 99);
 
     assert.equal(result.message_id, 8);
     assert.equal(requestedUrl, "https://api.telegram.org/bottoken/sendPhoto");
     assert.ok(requestedBody instanceof FormData);
     assert.equal(requestedBody.get("chat_id"), "42");
     assert.equal(requestedBody.get("caption"), "image");
+    assert.equal(requestedBody.get("reply_parameters"), JSON.stringify({ message_id: 99 }));
     const photo = requestedBody.get("photo");
     assert.ok(photo instanceof Blob);
     assert.equal((photo as File).name, "image.png");

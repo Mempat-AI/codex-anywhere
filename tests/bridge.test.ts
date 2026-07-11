@@ -15,6 +15,7 @@ import type {
   StoredConfig,
   StoredState,
   TelegramBotCommand,
+  TelegramInputRichMessage,
   TelegramUpdate,
 } from "../src/types.js";
 
@@ -27,7 +28,12 @@ class FakeTelegram {
     replyToMessageId?: number | null;
   }> = [];
   readonly sentDocuments: Array<{ chatId: number; filePath: string; caption?: string }> = [];
-  readonly sentPhotos: Array<{ chatId: number; filePath: string; caption?: string }> = [];
+  readonly sentPhotos: Array<{
+    chatId: number;
+    filePath: string;
+    caption?: string;
+    replyToMessageId?: number | null;
+  }> = [];
   readonly editedMessages: Array<{
     chatId: number;
     messageId: number;
@@ -36,6 +42,7 @@ class FakeTelegram {
     parseMode?: string;
   }> = [];
   readonly callbackAnswers: string[] = [];
+  readonly deletedMessages: Array<{ chatId: number; messageId: number }> = [];
 
   async getUpdates(): Promise<TelegramUpdate[]> {
     return [];
@@ -69,8 +76,13 @@ class FakeTelegram {
     return { message_id: this.sentMessages.length + this.sentDocuments.length + this.sentPhotos.length };
   }
 
-  async sendPhoto(chatId: number, filePath: string, caption?: string): Promise<{ message_id: number }> {
-    this.sentPhotos.push({ chatId, filePath, caption });
+  async sendPhoto(
+    chatId: number,
+    filePath: string,
+    caption?: string,
+    replyToMessageId?: number | null,
+  ): Promise<{ message_id: number }> {
+    this.sentPhotos.push({ chatId, filePath, caption, replyToMessageId });
     return { message_id: this.sentMessages.length + this.sentDocuments.length + this.sentPhotos.length };
   }
 
@@ -88,7 +100,73 @@ class FakeTelegram {
     this.callbackAnswers.push(text);
   }
 
-  async deleteMessage(): Promise<void> {}
+  async deleteMessage(chatId: number, messageId: number): Promise<void> {
+    this.deletedMessages.push({ chatId, messageId });
+  }
+}
+
+class FakeRichTelegram extends FakeTelegram {
+  readonly sentRichMessages: Array<{
+    chatId: number;
+    richMessage: TelegramInputRichMessage;
+    replyMarkup?: JsonObject;
+    replyToMessageId?: number | null;
+  }> = [];
+  readonly editedRichMessages: Array<{
+    chatId: number;
+    messageId: number;
+    richMessage: TelegramInputRichMessage;
+  }> = [];
+
+  async sendRichMessage(
+    chatId: number,
+    richMessage: TelegramInputRichMessage,
+    replyMarkup?: JsonObject,
+    replyToMessageId?: number | null,
+  ): Promise<{ message_id: number }> {
+    this.sentRichMessages.push({ chatId, richMessage, replyMarkup, replyToMessageId });
+    return { message_id: 10_000 + this.sentRichMessages.length };
+  }
+
+  async editRichMessage(
+    chatId: number,
+    messageId: number,
+    richMessage: TelegramInputRichMessage,
+  ): Promise<void> {
+    this.editedRichMessages.push({ chatId, messageId, richMessage });
+  }
+}
+
+class FinalUnsupportedRichTelegram extends FakeRichTelegram {
+  override async sendRichMessage(): Promise<{ message_id: number }> {
+    throw new Error("Bad Request: can't parse rich message");
+  }
+}
+
+class RichEditFailingTelegram extends FakeRichTelegram {
+  editAttempts = 0;
+
+  override async editRichMessage(): Promise<void> {
+    this.editAttempts += 1;
+    throw new Error("Bad Request: rich edit rejected");
+  }
+}
+
+class DetailsPartFailingRichTelegram extends FakeRichTelegram {
+  detailsPartFailures = 0;
+
+  override async sendRichMessage(
+    chatId: number,
+    richMessage: TelegramInputRichMessage,
+    replyMarkup?: JsonObject,
+    replyToMessageId?: number | null,
+  ): Promise<{ message_id: number }> {
+    if (richMessage.markdown?.startsWith("<details><summary>Work details</summary>")) {
+      this.detailsPartFailures += 1;
+      throw new Error("Bad Request: details part rejected");
+    }
+    return super.sendRichMessage(chatId, richMessage, replyMarkup, replyToMessageId);
+  }
 }
 
 class DelayedEditTelegram extends FakeTelegram {
@@ -278,6 +356,29 @@ async function waitForCondition(condition: () => boolean, attempts = 50, delayMs
   assert.fail("condition was not met in time");
 }
 
+async function completeCommentary(
+  bridge: CodexAnywhereBridge,
+  itemId: string,
+  text: string,
+): Promise<void> {
+  await bridge.handleNotificationForTest("item/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: { id: itemId, type: "agentMessage", phase: "commentary" },
+  });
+  await bridge.handleNotificationForTest("item/agentMessage/delta", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    itemId,
+    delta: text,
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: { id: itemId, type: "agentMessage", phase: "commentary", text },
+  });
+}
+
 runOmxCommandTest("bridge routes /omx version through Telegram message output", serialTest, async () => {
   const telegram = new FakeTelegram();
   const codex = new FakeCodex();
@@ -387,9 +488,8 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.equal(telegram.sentMessages.length, 1);
   assert.equal(telegram.sentMessages[0]!.replyToMessageId, 1);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^Thinking\n/);
-  assert.equal(telegram.editedMessages.length, 1);
-  assert.equal(telegram.editedMessages[0]!.messageId, 1);
+  assert.match(telegram.sentMessages[0]!.text, /^Writing final answer\n/);
+  assert.equal(telegram.editedMessages.length, 0);
 
   await bridge.handleNotificationForTest("turn/completed", {
     threadId: "thread-1",
@@ -408,10 +508,466 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
   assert.equal(telegram.sentMessages[2]!.parseMode, "HTML");
   assert.equal(telegram.sentMessages[3]!.parseMode, "HTML");
-  assert.equal(telegram.editedMessages.length, 2);
-  assert.equal(telegram.editedMessages[1]!.messageId, 1);
-  assert.match(telegram.editedMessages[1]!.text, /Run details/);
-  assert.doesNotMatch(telegram.editedMessages[1]!.text, /^a+$/);
+  assert.equal(telegram.editedMessages.length, 1);
+  assert.equal(telegram.editedMessages[0]!.messageId, 1);
+  assert.match(telegram.editedMessages[0]!.text, /Run details/);
+  assert.doesNotMatch(telegram.editedMessages[0]!.text, /^a+$/);
+});
+
+test("rich turn lifecycle keeps one referenced card from progress through final", async () => {
+  const telegram = new FakeRichTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("compare models"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.sentRichMessages[0]!.replyToMessageId, 1);
+  assert.match(
+    telegram.sentRichMessages[0]!.richMessage.markdown ?? "",
+    /<blockquote>Analyzing request<\/blockquote>/,
+  );
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "cmd-1",
+      type: "commandExecution",
+      command: "pnpm test",
+      status: "completed",
+      exitCode: 0,
+    },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "| Model | Role |\n| --- | --- |\n| sol | flagship |",
+      phase: "final",
+    },
+  });
+
+  assert.equal(telegram.sentMessages.length, 0);
+  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.ok(telegram.editedRichMessages.length >= 2);
+  assert.match(telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "", /^\| Model \| Role \|/);
+  assert.match(telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "", /<details>/);
+
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed" },
+  });
+
+  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.sentRichMessages[0]!.replyToMessageId, 1);
+  assert.ok(
+    telegram.editedRichMessages.every(
+      (message) => message.messageId === 10_001,
+    ),
+  );
+  const finalMarkdown = telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "";
+  assert.match(finalMarkdown, /^\| Model \| Role \|/);
+  assert.match(finalMarkdown, /<summary>Work details<\/summary>/);
+  assert.match(finalMarkdown, /pnpm test/);
+  assert.doesNotMatch(finalMarkdown, /<blockquote>/);
+  assert.equal(telegram.sentMessages.length, 0);
+  assert.equal(telegram.deletedMessages.length, 0);
+});
+
+test("rich progress keeps typing active until the turn completes", async () => {
+  const telegram = new FakeRichTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("inspect the project"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  assert.equal(bridge.typingIndicatorActiveForTest(42), true);
+
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "cmd-1",
+      type: "commandExecution",
+      command: "pnpm test",
+      status: "completed",
+      exitCode: 0,
+    },
+  });
+  assert.equal(bridge.typingIndicatorActiveForTest(42), true);
+
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Done.",
+      phase: "final",
+    },
+  });
+  assert.equal(bridge.typingIndicatorActiveForTest(42), true);
+
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed" },
+  });
+  assert.equal(bridge.typingIndicatorActiveForTest(42), false);
+});
+
+test("completed image generation uploads one inline preview replying to the request", async () => {
+  const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-anywhere-generated-preview-"));
+  const imagePath = path.join(tempDir, "generated.png");
+  await fs.writeFile(imagePath, Buffer.from([137, 80, 78, 71]));
+  const canonicalImagePath = await fs.realpath(imagePath);
+  try {
+    const telegram = new FakeRichTelegram();
+    const codex = new FakeCodex();
+    const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+      telegram,
+      codex,
+      initialState: testState(),
+    });
+
+    await bridge.handleUpdateForTest(telegramMessageUpdate("generate an image", 7));
+    await bridge.handleNotificationForTest("turn/started", {
+      threadId: "thread-1",
+      turn: { id: "turn-1" },
+    });
+    const completedImage = {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        id: "image-1",
+        type: "imageGeneration",
+        status: "completed",
+        result: "generated",
+        savedPath: imagePath,
+      },
+    } satisfies JsonObject;
+
+    await bridge.handleNotificationForTest("item/completed", completedImage);
+    await bridge.handleNotificationForTest("item/completed", completedImage);
+
+    assert.deepEqual(telegram.sentPhotos, [{
+      chatId: 42,
+      filePath: canonicalImagePath,
+      caption: "Generated image",
+      replyToMessageId: 7,
+    }]);
+
+    await bridge.handleNotificationForTest("item/completed", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: { id: "final-1", type: "agentMessage", text: "Image ready.", phase: "final" },
+    });
+    await bridge.handleNotificationForTest("turn/completed", {
+      threadId: "thread-1",
+      turn: { id: "turn-1", status: "completed" },
+    });
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("starting a commentary item preserves the latest meaningful rich status", async () => {
+  const telegram = new FakeRichTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("inspect the project"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "cmd-1",
+      type: "commandExecution",
+      command: "pnpm test",
+      status: "completed",
+      exitCode: 0,
+    },
+  });
+
+  const editCount = telegram.editedRichMessages.length;
+  assert.match(
+    telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "",
+    /Command completed, exit 0: pnpm test/,
+  );
+
+  await bridge.handleNotificationForTest("item/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "commentary-2",
+      type: "agentMessage",
+      phase: "commentary",
+    },
+  });
+
+  assert.equal(telegram.editedRichMessages.length, editCount);
+  assert.doesNotMatch(
+    telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "",
+    /<blockquote>Thinking<\/blockquote>/,
+  );
+});
+
+test("rich turn history appends preamble loops and updates tool calls in place", async () => {
+  const telegram = new FakeRichTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("compare Slack and lock behavior"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  await completeCommentary(bridge, "preamble-1", "I will inspect the Slack implementation first.");
+
+  await bridge.handleNotificationForTest("item/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "cmd-1",
+      type: "commandExecution",
+      command: "rg Slack src",
+      status: "inProgress",
+    },
+  });
+  assert.match(
+    telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "",
+    /<summary><b>Tool<\/b> Running command: rg Slack src<\/summary>/,
+  );
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "cmd-1",
+      type: "commandExecution",
+      command: "rg Slack src",
+      status: "completed",
+      exitCode: 0,
+    },
+  });
+
+  await completeCommentary(bridge, "preamble-2", "Now I will verify the lock path.");
+  await bridge.handleNotificationForTest("item/started", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "mcp-1",
+      type: "mcpToolCall",
+      server: "workspace",
+      tool: "read_lock",
+      status: "inProgress",
+      arguments: { path: "lock.ts" },
+    },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "mcp-1",
+      type: "mcpToolCall",
+      server: "workspace",
+      tool: "read_lock",
+      status: "completed",
+      arguments: { path: "lock.ts" },
+      result: { ok: true },
+    },
+  });
+
+  const liveMarkdown = telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "";
+  const firstPreamble = liveMarkdown.indexOf("I will inspect the Slack implementation first.");
+  const firstTool = liveMarkdown.indexOf("Command completed, exit 0: rg Slack src");
+  const secondPreamble = liveMarkdown.indexOf("Now I will verify the lock path.");
+  const secondTool = liveMarkdown.indexOf("workspace.read_lock completed");
+  assert.ok(firstPreamble >= 0 && firstPreamble < firstTool);
+  assert.ok(firstTool < secondPreamble && secondPreamble < secondTool);
+  assert.equal(liveMarkdown.match(/<details>/g)?.length, 2);
+  assert.equal(liveMarkdown.match(/<li>/g)?.length, 2);
+  assert.doesNotMatch(liveMarkdown, /Running command: rg Slack src/);
+  assert.doesNotMatch(liveMarkdown, /<summary>Work details<\/summary>/);
+
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Slack and lock differ in ownership scope.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed" },
+  });
+
+  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.sentRichMessages[0]!.replyToMessageId, 1);
+  const finalMarkdown = telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "";
+  assert.match(
+    finalMarkdown,
+    /^Slack and lock differ in ownership scope\.\n\n<details><summary>Work details<\/summary>/,
+  );
+  assert.match(finalMarkdown, /I will inspect the Slack implementation first\./);
+  assert.match(finalMarkdown, /Now I will verify the lock path\./);
+  assert.equal(finalMarkdown.match(/<details>/g)?.length, 3);
+});
+
+test("a failed final rich edit sends the response and deletes the stale progress card", async () => {
+  const telegram = new RichEditFailingTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("hello"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.sentRichMessages[0]!.replyToMessageId, 1);
+
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Final after edit failure.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed" },
+  });
+
+  assert.ok(telegram.editAttempts >= 2);
+  assert.equal(telegram.sentRichMessages.length, 2);
+  assert.equal(telegram.sentRichMessages[1]!.replyToMessageId, 1);
+  assert.equal(telegram.sentRichMessages[1]!.richMessage.markdown, "Final after edit failure.");
+  assert.deepEqual(telegram.deletedMessages, [{ chatId: 42, messageId: 10_001 }]);
+  assert.equal(telegram.sentMessages.length, 0);
+});
+
+test("a rejected rich final falls back to the legacy details card and HTML response", async () => {
+  const telegram = new FinalUnsupportedRichTelegram();
+  const codex = new FakeCodex();
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: testState(),
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("hello"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: "Fallback final.",
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed" },
+  });
+
+  assert.equal(telegram.sentRichMessages.length, 0);
+  assert.equal(telegram.sentMessages.length, 2);
+  assert.match(telegram.sentMessages[0]!.text, /Run details/);
+  assert.equal(telegram.sentMessages[1]!.text, "Fallback final.");
+  assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
+});
+
+test("a rejected standalone rich details part falls back exactly once", async () => {
+  const telegram = new DetailsPartFailingRichTelegram();
+  const codex = new FakeCodex();
+  const state = testState();
+  state.chats["42"] = testChatState({ verbose: true });
+  const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
+    telegram,
+    codex,
+    initialState: state,
+  });
+
+  await bridge.handleUpdateForTest(telegramMessageUpdate("long answer"));
+  await bridge.handleNotificationForTest("turn/started", {
+    threadId: "thread-1",
+    turn: { id: "turn-1" },
+  });
+  for (let index = 0; index < 8; index += 1) {
+    await bridge.handleNotificationForTest("item/completed", {
+      threadId: "thread-1",
+      turnId: "turn-1",
+      item: {
+        id: `cmd-${index}`,
+        type: "commandExecution",
+        command: `command-${index}`,
+        status: "completed",
+        exitCode: 0,
+        aggregatedOutput: "x".repeat(2_000),
+      },
+    });
+  }
+  await bridge.handleNotificationForTest("item/completed", {
+    threadId: "thread-1",
+    turnId: "turn-1",
+    item: {
+      id: "final-1",
+      type: "agentMessage",
+      text: `${"<".repeat(2_200)}${"a".repeat(21_800)}`,
+      phase: "final",
+    },
+  });
+  await bridge.handleNotificationForTest("turn/completed", {
+    threadId: "thread-1",
+    turn: { id: "turn-1", status: "completed" },
+  });
+
+  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.detailsPartFailures, 1);
+  assert.equal(telegram.sentMessages.length, 1);
+  assert.match(telegram.sentMessages[0]!.text, /Run details/);
 });
 
 test("overlapping final card flushes reserve the final response before sending", async () => {
@@ -562,7 +1118,7 @@ test("turn card keeps run details above a fresh final answer message", async () 
   assert.equal(telegram.sentMessages[0]!.parseMode, "HTML");
   assert.match(telegram.sentMessages[0]!.text, /<blockquote expandable>/);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);
-  assert.match(telegram.sentMessages[0]!.text, /^Thinking\n/);
+  assert.match(telegram.sentMessages[0]!.text, /^I will inspect the Telegram bridge\.\n/);
   assert.equal(telegram.sentMessages[1]!.replyToMessageId, 1);
   assert.equal(telegram.sentMessages[1]!.parseMode, "HTML");
   assert.equal(telegram.sentMessages[1]!.text, "Done.");

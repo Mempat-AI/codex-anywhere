@@ -206,6 +206,14 @@ export function renderAssistantTextHtml(text: string): string {
       continue;
     }
 
+    const tableStart = findNextMarkdownTableStart(text, cursor);
+    if (tableStart === cursor) {
+      const rendered = renderMarkdownTableAt(text, cursor, renderMarkdownPreTable);
+      parts.push(rendered.html);
+      cursor = rendered.nextCursor;
+      continue;
+    }
+
     if (text[cursor] === "`") {
       const rendered = renderInlineCode(text, cursor);
       parts.push(rendered.html);
@@ -215,7 +223,7 @@ export function renderAssistantTextHtml(text: string): string {
 
     const nextFence = text.indexOf("```", cursor);
     const nextInline = text.indexOf("`", cursor);
-    const nextMarker = [nextFence, nextInline]
+    const nextMarker = [nextFence, nextInline, tableStart]
       .filter((index) => index >= 0)
       .reduce((smallest, index) => Math.min(smallest, index), text.length);
     parts.push(renderPlainMarkdown(text.slice(cursor, nextMarker)));
@@ -223,6 +231,69 @@ export function renderAssistantTextHtml(text: string): string {
   }
 
   return parts.join("");
+}
+
+function findNextMarkdownTableStart(text: string, cursor: number): number {
+  let lineStart = cursor === 0 || text[cursor - 1] === "\n" ? cursor : text.indexOf("\n", cursor) + 1;
+  if (lineStart === 0 && cursor !== 0 && text.indexOf("\n", cursor) === -1) {
+    return -1;
+  }
+  while (lineStart >= 0 && lineStart < text.length) {
+    const lineEnd = nextLineEnd(text, lineStart);
+    const nextLineStart = lineEnd < text.length ? lineEnd + 1 : text.length;
+    const nextLineEndIndex = nextLineStart < text.length ? nextLineEnd(text, nextLineStart) : text.length;
+    const line = text.slice(lineStart, lineEnd);
+    const nextLine = text.slice(nextLineStart, nextLineEndIndex);
+    if (looksLikeMarkdownTableRow(line) && isMarkdownTableSeparator(nextLine)) {
+      return lineStart;
+    }
+    if (nextLineStart >= text.length) {
+      return -1;
+    }
+    lineStart = nextLineStart;
+  }
+  return -1;
+}
+
+function renderMarkdownTableAt(
+  text: string,
+  cursor: number,
+  renderTable: (rows: string[][]) => string,
+): { html: string; nextCursor: number } {
+  const lines: string[] = [];
+  let lineStart = cursor;
+  while (lineStart < text.length) {
+    const lineEnd = nextLineEnd(text, lineStart);
+    lines.push(text.slice(lineStart, lineEnd));
+    if (lineEnd >= text.length) {
+      break;
+    }
+    lineStart = lineEnd + 1;
+  }
+  const parsed = parseMarkdownTable(lines, 0);
+  if (!parsed) {
+    return {
+      html: renderPlainMarkdown(text.slice(cursor, nextLineEnd(text, cursor))),
+      nextCursor: nextLineEnd(text, cursor),
+    };
+  }
+
+  let nextCursor = cursor;
+  for (let index = 0; index < parsed.nextIndex; index += 1) {
+    nextCursor = nextLineEnd(text, nextCursor);
+    if (index < parsed.nextIndex - 1 && nextCursor < text.length) {
+      nextCursor += 1;
+    }
+  }
+  return {
+    html: renderTable(parsed.rows),
+    nextCursor,
+  };
+}
+
+function nextLineEnd(text: string, cursor: number): number {
+  const newline = text.indexOf("\n", cursor);
+  return newline >= 0 ? newline : text.length;
 }
 
 /** Telegram message text limit with safety margin (API max is 4096). */
@@ -448,33 +519,151 @@ function summarizePathLikeArg(command: string): string | null {
 // Handles ATX headings, horizontal rules, bullet lists, links, and **bold** markers.
 function renderPlainMarkdown(text: string): string {
   const lines = text.split("\n");
-  return lines
-    .map((line, idx) => {
-      // Horizontal rules: ---, ***, ___
-      if (/^[\s]*[-*_]{3,}\s*$/.test(line)) {
-        return "———";
-      }
-      // ATX headings: # … / ## … / ### …
-      const headingMatch = /^(#{1,3}) (.+)$/.exec(line);
-      if (headingMatch) {
-        const prefix = idx > 0 ? "\n" : "";
-        return `${prefix}<b>${renderInlineMarkdown(headingMatch[2]!)}</b>`;
-      }
-      // Unordered list items: - … / * …
-      const bulletMatch = /^(\s*)[*-] (.+)$/.exec(line);
-      if (bulletMatch) {
-        const indent = bulletMatch[1]!.length > 0 ? "  " : "";
-        return `${indent}• ${renderInlineMarkdown(bulletMatch[2]!)}`;
-      }
-      // Ordered list items: 1. …
-      const orderedMatch = /^(\s*)(\d+)\. (.+)$/.exec(line);
-      if (orderedMatch) {
-        const indent = orderedMatch[1]!.length > 0 ? "  " : "";
-        return `${indent}${orderedMatch[2]}. ${renderInlineMarkdown(orderedMatch[3]!)}`;
-      }
-      return renderInlineMarkdown(line);
-    })
-    .join("\n");
+  const rendered: string[] = [];
+  for (let idx = 0; idx < lines.length; idx += 1) {
+    const table = parseMarkdownTable(lines, idx);
+    if (table) {
+      rendered.push(renderMarkdownPreTable(table.rows));
+      idx = table.nextIndex - 1;
+      continue;
+    }
+
+    const line = lines[idx]!;
+    // Horizontal rules: ---, ***, ___
+    if (/^[\s]*[-*_]{3,}\s*$/.test(line)) {
+      rendered.push("———");
+      continue;
+    }
+    // ATX headings: # … / ## … / ### …
+    const headingMatch = /^(#{1,3}) (.+)$/.exec(line);
+    if (headingMatch) {
+      const prefix = idx > 0 ? "\n" : "";
+      rendered.push(`${prefix}<b>${renderInlineMarkdown(headingMatch[2]!)}</b>`);
+      continue;
+    }
+    // Unordered list items: - … / * …
+    const bulletMatch = /^(\s*)[*-] (.+)$/.exec(line);
+    if (bulletMatch) {
+      const indent = bulletMatch[1]!.length > 0 ? "  " : "";
+      rendered.push(`${indent}• ${renderInlineMarkdown(bulletMatch[2]!)}`);
+      continue;
+    }
+    // Ordered list items: 1. …
+    const orderedMatch = /^(\s*)(\d+)\. (.+)$/.exec(line);
+    if (orderedMatch) {
+      const indent = orderedMatch[1]!.length > 0 ? "  " : "";
+      rendered.push(`${indent}${orderedMatch[2]}. ${renderInlineMarkdown(orderedMatch[3]!)}`);
+      continue;
+    }
+    rendered.push(renderInlineMarkdown(line));
+  }
+  return rendered.join("\n");
+}
+
+function parseMarkdownTable(
+  lines: string[],
+  start: number,
+): { rows: string[][]; nextIndex: number } | null {
+  const header = lines[start];
+  const separator = lines[start + 1];
+  if (!header || !separator || !looksLikeMarkdownTableRow(header) || !isMarkdownTableSeparator(separator)) {
+    return null;
+  }
+
+  const rows = [splitMarkdownTableRow(header)];
+  let cursor = start + 2;
+  while (cursor < lines.length && looksLikeMarkdownTableRow(lines[cursor]!)) {
+    rows.push(splitMarkdownTableRow(lines[cursor]!));
+    cursor += 1;
+  }
+  return { rows, nextIndex: cursor };
+}
+
+function looksLikeMarkdownTableRow(line: string): boolean {
+  return line.includes("|") && splitMarkdownTableRow(line).length > 1;
+}
+
+function isMarkdownTableSeparator(line: string): boolean {
+  const cells = splitMarkdownTableRow(line);
+  return cells.length > 1 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
+function splitMarkdownTableRow(line: string): string[] {
+  let trimmed = line.trim();
+  if (trimmed.startsWith("|")) {
+    trimmed = trimmed.slice(1);
+  }
+  if (trimmed.endsWith("|")) {
+    trimmed = trimmed.slice(0, -1);
+  }
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function renderMarkdownPreTable(rows: string[][]): string {
+  const columnCount = Math.max(...rows.map((row) => row.length));
+  const normalizedRows = rows.map((row) =>
+    Array.from({ length: columnCount }, (_, index) => stripInlineMarkdownForTable(row[index] ?? "")),
+  );
+  const widths = Array.from({ length: columnCount }, (_, column) =>
+    Math.max(...normalizedRows.map((row) => displayWidth(row[column] ?? "")), 1),
+  );
+  const lines = normalizedRows.map((row, rowIndex) => {
+    const renderedCells = row.map((cell, column) => padDisplay(cell, widths[column]!));
+    const line = renderedCells.join(" | ");
+    if (rowIndex !== 0) {
+      return line;
+    }
+    const divider = widths.map((width) => "-".repeat(width)).join("-+-");
+    return `${line}\n${divider}`;
+  });
+  return `<pre>${escapeTelegramHtml(lines.join("\n"))}</pre>`;
+}
+
+function stripInlineMarkdownForTable(text: string): string {
+  return text
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1");
+}
+
+function padDisplay(text: string, width: number): string {
+  const padding = Math.max(0, width - displayWidth(text));
+  return `${text}${" ".repeat(padding)}`;
+}
+
+function displayWidth(text: string): number {
+  let width = 0;
+  for (const char of text) {
+    const code = char.codePointAt(0) ?? 0;
+    if (isCombiningCodePoint(code)) {
+      continue;
+    }
+    width += isWideCodePoint(code) ? 2 : 1;
+  }
+  return width;
+}
+
+function isCombiningCodePoint(code: number): boolean {
+  return (
+    (code >= 0x0300 && code <= 0x036f)
+    || (code >= 0x1ab0 && code <= 0x1aff)
+    || (code >= 0x1dc0 && code <= 0x1dff)
+    || (code >= 0x20d0 && code <= 0x20ff)
+    || (code >= 0xfe20 && code <= 0xfe2f)
+  );
+}
+
+function isWideCodePoint(code: number): boolean {
+  return (
+    (code >= 0x1100 && code <= 0x115f)
+    || (code >= 0x2e80 && code <= 0xa4cf)
+    || (code >= 0xac00 && code <= 0xd7a3)
+    || (code >= 0xf900 && code <= 0xfaff)
+    || (code >= 0xfe10 && code <= 0xfe19)
+    || (code >= 0xfe30 && code <= 0xfe6f)
+    || (code >= 0xff00 && code <= 0xff60)
+    || (code >= 0xffe0 && code <= 0xffe6)
+  );
 }
 
 // Render simple inline Markdown within a single line of plain text.
