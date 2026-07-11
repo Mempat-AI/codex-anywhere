@@ -514,7 +514,7 @@ test("final agent message chunks are sent from the turn card only once", async (
   assert.doesNotMatch(telegram.editedMessages[0]!.text, /^a+$/);
 });
 
-test("rich turn lifecycle keeps one referenced card from progress through final", async () => {
+test("rich turn lifecycle sends a new referenced final card and removes progress", async () => {
   const telegram = new FakeRichTelegram();
   const codex = new FakeCodex();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
@@ -567,20 +567,20 @@ test("rich turn lifecycle keeps one referenced card from progress through final"
     turn: { id: "turn-1", status: "completed" },
   });
 
-  assert.equal(telegram.sentRichMessages.length, 1);
-  assert.equal(telegram.sentRichMessages[0]!.replyToMessageId, 1);
+  assert.equal(telegram.sentRichMessages.length, 2);
+  assert.equal(telegram.sentRichMessages[1]!.replyToMessageId, 1);
   assert.ok(
     telegram.editedRichMessages.every(
       (message) => message.messageId === 10_001,
     ),
   );
-  const finalMarkdown = telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "";
+  const finalMarkdown = telegram.sentRichMessages[1]!.richMessage.markdown ?? "";
   assert.match(finalMarkdown, /^\| Model \| Role \|/);
   assert.match(finalMarkdown, /<summary>Work details<\/summary>/);
   assert.match(finalMarkdown, /pnpm test/);
   assert.doesNotMatch(finalMarkdown, /<blockquote>/);
   assert.equal(telegram.sentMessages.length, 0);
-  assert.equal(telegram.deletedMessages.length, 0);
+  assert.deepEqual(telegram.deletedMessages, [{ chatId: 42, messageId: 10_001 }]);
 });
 
 test("rich progress keeps typing active until the turn completes", async () => {
@@ -831,9 +831,10 @@ test("rich turn history appends preamble loops and updates tool calls in place",
     turn: { id: "turn-1", status: "completed" },
   });
 
-  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.sentRichMessages.length, 2);
   assert.equal(telegram.sentRichMessages[0]!.replyToMessageId, 1);
-  const finalMarkdown = telegram.editedRichMessages.at(-1)!.richMessage.markdown ?? "";
+  assert.equal(telegram.sentRichMessages[1]!.replyToMessageId, 1);
+  const finalMarkdown = telegram.sentRichMessages[1]!.richMessage.markdown ?? "";
   assert.match(
     finalMarkdown,
     /^Slack and lock differ in ownership scope\.\n\n<details><summary>Work details<\/summary>/,
@@ -843,7 +844,7 @@ test("rich turn history appends preamble loops and updates tool calls in place",
   assert.equal(finalMarkdown.match(/<details>/g)?.length, 3);
 });
 
-test("a failed final rich edit sends the response and deletes the stale progress card", async () => {
+test("a failed progress rich edit still sends a fresh final and deletes stale progress", async () => {
   const telegram = new RichEditFailingTelegram();
   const codex = new FakeCodex();
   const bridge = new CodexAnywhereBridge(testConfig(), "/tmp/config.json", "/tmp/state.json", {
@@ -875,7 +876,7 @@ test("a failed final rich edit sends the response and deletes the stale progress
     turn: { id: "turn-1", status: "completed" },
   });
 
-  assert.ok(telegram.editAttempts >= 2);
+  assert.ok(telegram.editAttempts >= 1);
   assert.equal(telegram.sentRichMessages.length, 2);
   assert.equal(telegram.sentRichMessages[1]!.replyToMessageId, 1);
   assert.equal(telegram.sentRichMessages[1]!.richMessage.markdown, "Final after edit failure.");
@@ -964,7 +965,7 @@ test("a rejected standalone rich details part falls back exactly once", async ()
     turn: { id: "turn-1", status: "completed" },
   });
 
-  assert.equal(telegram.sentRichMessages.length, 1);
+  assert.equal(telegram.sentRichMessages.length, 2);
   assert.equal(telegram.detailsPartFailures, 1);
   assert.equal(telegram.sentMessages.length, 1);
   assert.match(telegram.sentMessages[0]!.text, /Run details/);

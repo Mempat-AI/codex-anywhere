@@ -4089,24 +4089,6 @@ export class CodexAnywhereBridge {
     let allRich = true;
     let traceFallbackSent = false;
     for (const [index, part] of parts.entries()) {
-      if (
-        index === 0
-        && card.richProgressMessageId !== null
-        && this.#telegram.editRichMessage
-      ) {
-        try {
-          await this.#telegram.editRichMessage(
-            card.chatId,
-            card.richProgressMessageId,
-            part.richMessage,
-          );
-          card.richProgressMessageId = null;
-          sentAny = true;
-          continue;
-        } catch (error) {
-          this.#logRuntimeError("finalize rich progress", error);
-        }
-      }
       try {
         await this.#telegram.sendRichMessage(
           card.chatId,
